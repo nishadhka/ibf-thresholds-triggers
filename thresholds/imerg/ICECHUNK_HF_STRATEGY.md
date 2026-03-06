@@ -90,10 +90,67 @@ HuggingFace is ideal as the **distribution endpoint** — free, public, and
 community-friendly. GCS serves as the **write-time backend** only during
 heavy backfill operations.
 
-## Test plan: Local Icechunk to HuggingFace with incremental updates
+## Test results: Incremental Icechunk to HuggingFace (validated 2026-03-06)
 
-To validate that the local→HF pattern supports incremental updates (not just
-one-shot uploads), run this test:
+The incremental update pattern was tested end-to-end with a 2-week window
+(2024-12-01 to 2024-12-14), filling week 1, uploading to HF, then filling
+week 2 and re-uploading. Store name: `test3_imerg-update-test`.
+
+### Step-by-step results
+
+| Step | Action | Result |
+|------|--------|--------|
+| 1 | Init 2-week template (Dec 1-14) | `(14, 350, 320)` — 14 days x 350 lat x 320 lon, 7.4s |
+| 2 | Fill week 1 (Dec 1-7) | 7/7 granules → indices 0-6, 2.7s write time |
+| 3 | Verify week 1 | 560,000/560,000 valid values, min=0.0, max=210.72, mean=1.99 mm/day |
+| 4 | Upload week 1 to HF | 19 files, 2.5 KB → `E4DRR/icechunk-stores/test3_imerg-update-test` |
+| 5 | Fill week 2 (Dec 8-14) | 7/7 granules → indices 7-13, resume detected 0-6 as done |
+| 6 | Verify both weeks | 4 commits in history, all 14 days present |
+| 7 | Re-upload to HF | 29 files, 9.1 KB — only new/changed chunks uploaded |
+
+### Key findings
+
+1. **Incremental fill works** — week 2 was written to correct template indices
+   (7-13) without overwriting week 1 data. Date-based index mapping ensures
+   granules land in the right time slots regardless of search query range.
+
+2. **Resume detection works** — on the week 2 fill, the pipeline correctly
+   identified indices 0-6 as already committed and only processed 7-13.
+
+3. **HF incremental upload works** — `huggingface_hub.upload_folder()` only
+   transferred new/changed files. Store grew from 19→29 files (2.5→9.1 KB)
+   but HF only uploaded the delta, not the full store.
+
+4. **Icechunk commit history preserved** — 4 commits tracked:
+   ```
+   fill batch 7-13: 7/7 OK
+   fill batch 0-6: 7/7 OK
+   initialize IMERG Daily EA template
+   Repository initialized
+   ```
+
+5. **Week 1 data intact after week 2 fill** — verification confirmed all 14
+   days have valid precipitation values after both fill cycles.
+
+### Bug fixed during testing
+
+The original fill logic used sequential indices (0, 1, 2...) based on
+`enumerate(search_results)`, which meant a second fill with a different date
+range would write to indices 0-6 again, overwriting week 1. Fixed by:
+
+- Reading the template's time coordinate after opening the store
+- Mapping each granule's date (from UMM metadata `BeginningDateTime`) to the
+  correct template time index
+- Handling timezone mismatch (granule dates are UTC-aware, template is tz-naive)
+  with `tz_localize(None)`
+
+### HF store location
+
+```
+https://huggingface.co/datasets/E4DRR/icechunk-stores/tree/main/test3_imerg-update-test
+```
+
+## Test plan commands (reproducible)
 
 ### Test 1: Initial week
 
@@ -114,7 +171,7 @@ uv run --python 3.12 imerg_daily_ea_icechunk.py verify \
 
 # 4. Upload to HF
 uv run --python 3.12 test_hf_icechunk.py \
-    --store ./imerg_ea_update_test --upload
+    --store ./imerg_ea_update_test --prefix test3_imerg-update-test --upload
 ```
 
 ### Test 2: Incremental update (week 2)
@@ -129,26 +186,29 @@ uv run --python 3.12 imerg_daily_ea_icechunk.py fill \
 uv run --python 3.12 imerg_daily_ea_icechunk.py verify \
     --local ./imerg_ea_update_test
 
-# 7. Re-upload (should sync only changed/new chunks)
+# 7. Re-upload (only changed/new chunks transferred)
 uv run --python 3.12 test_hf_icechunk.py \
-    --store ./imerg_ea_update_test --upload
+    --store ./imerg_ea_update_test --prefix test3_imerg-update-test --upload
 ```
 
-### What this validates
+### Plot any 7-day window
 
-- Icechunk store survives multiple fill+commit cycles
-- `huggingface_hub.upload_folder()` handles incremental uploads (only changed files)
-- Week 1 data is preserved after week 2 fill
-- HF store is readable after incremental update
-- Commit history in Icechunk tracks each batch
+```bash
+# Plot specific date range from the store
+uv run --python 3.12 plot_imerg_ea.py \
+    --store ./imerg_ea_update_test \
+    --start-date 2024-12-05 --end-date 2024-12-11 \
+    --geojson ea_ghcf_simple.geojson \
+    --outdir ./plots
+```
 
 ## Summary
 
-| Scenario | Backend | Cluster | Upload to HF |
-|----------|---------|---------|--------------|
-| Initial backfill (2000-2024) | GCS Icechunk | Coiled 10-20 workers | After completion |
-| Daily/weekly updates | Local Icechunk | None (sequential) | After each update |
-| Read access (consumers) | HuggingFace | N/A | N/A |
+| Scenario | Backend | Cluster | Upload to HF | Validated |
+|----------|---------|---------|--------------|-----------|
+| Initial backfill (2000-2024) | GCS Icechunk | Coiled 10-20 workers | After completion | Pending (needs GCS SA) |
+| Daily/weekly updates | Local Icechunk | None (sequential) | After each update | Yes (test3) |
+| Read access (consumers) | HuggingFace | N/A | N/A | Yes |
 
 The key insight: **use the right tool for each phase**. GCS + Dask for heavy
 writes, local + sequential for light updates, HuggingFace for free public

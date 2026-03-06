@@ -400,7 +400,8 @@ def _write_result_to_icechunk(session, result):
     idx = result["idx"]
     data = result["data"]
     n_t = data.shape[0]
-    t_start = idx * n_t
+    # idx is the template time index (date-mapped), not a sequential counter
+    t_start = idx
     t_end = t_start + n_t
 
     ds_write = xr.Dataset({
@@ -439,7 +440,7 @@ def fill_ea_store(args):
         return
     logger.info(f"  {n_granules} granules to process")
 
-    # Open target Icechunk store + resume detection
+    # Open target Icechunk store + read template time axis for date mapping
     if args.local:
         target_storage = icechunk.local_filesystem_storage(path=args.local)
     else:
@@ -449,28 +450,65 @@ def fill_ea_store(args):
         target_storage, config=icechunk.RepositoryConfig.default()
     )
 
-    # Resume detection
-    completed_up_to = -1
+    # Read template time coordinate to map granule dates → time indices
+    import xarray as xr
+    _session = target_repo.readonly_session("main")
+    _ds = xr.open_zarr(_session.store, consolidated=False)
+    template_times = pd.DatetimeIndex(_ds.time.values)
+    logger.info(f"  Template time axis: {len(template_times)} slots "
+                f"[{template_times[0].date()} .. {template_times[-1].date()}]")
+
+    # Map each granule to its template time index by date
+    # Extract date from granule filename (e.g. 3B-DAY-E...20241201...)
+    import re
+    granule_indexed = []
+    for result in results:
+        # Get the date from the granule's time range
+        try:
+            time_start = result["umm"]["TemporalExtent"]["RangeDateTime"]["BeginningDateTime"]
+            granule_date = pd.Timestamp(time_start).tz_localize(None).normalize()
+        except (KeyError, TypeError):
+            # Fallback: try filename
+            for url_info in result["umm"]["RelatedUrls"]:
+                url = url_info.get("URL", "")
+                match = re.search(r"(\d{8})", url)
+                if match:
+                    granule_date = pd.Timestamp(match.group(1))
+                    break
+            else:
+                logger.warning(f"  Could not extract date from granule, skipping")
+                continue
+
+        # Find matching index in template
+        matches = np.where(template_times.normalize() == granule_date)[0]
+        if len(matches) == 0:
+            logger.warning(f"  Granule date {granule_date.date()} not in template, skipping")
+            continue
+        t_idx = int(matches[0])
+        granule_indexed.append((t_idx, result))
+
+    logger.info(f"  Mapped {len(granule_indexed)} granules to template indices")
+
+    # Resume detection: check which time indices already have data
+    completed_indices = set()
     try:
         for commit in target_repo.ancestry(branch="main"):
             msg = commit.message
             if msg.startswith("fill batch "):
                 try:
                     range_str = msg.split(":")[0].replace("fill batch ", "")
-                    _, b_end = range_str.split("-")
-                    b_end_int = int(b_end)
-                    if b_end_int > completed_up_to:
-                        completed_up_to = b_end_int
+                    b_start, b_end = range_str.split("-")
+                    for i in range(int(b_start), int(b_end) + 1):
+                        completed_indices.add(i)
                 except (ValueError, IndexError):
                     pass
     except Exception:
         pass
 
-    start_idx = completed_up_to + 1
-    if start_idx > 0:
-        logger.info(f"  Resuming from granule {start_idx} (0-{completed_up_to} done)")
-
-    remaining_results = list(enumerate(results))[start_idx:]
+    remaining_results = [(idx, r) for idx, r in granule_indexed if idx not in completed_indices]
+    if completed_indices:
+        logger.info(f"  Already filled: {len(completed_indices)} indices — "
+                    f"{sorted(completed_indices)[:10]}{'...' if len(completed_indices) > 10 else ''}")
     if not remaining_results:
         logger.info("  All granules already filled!")
         return {"status": "success", "message": "already complete"}
