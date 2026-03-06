@@ -208,11 +208,11 @@ def get_hf_icechunk_storage():
     """Create Icechunk storage config for HuggingFace."""
     import icechunk
 
-    hf_token = os.getenv("HF_TOKEN")
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("hf")
     if not hf_token:
         raise ValueError(
-            "Missing HF_TOKEN! Set it in .env or environment:\n"
-            "  HF_TOKEN=hf_your_token_here"
+            "Missing HF token! Set it in .env or environment:\n"
+            "  HF_TOKEN=hf_your_token_here  (or hf=hf_your_token_here)"
         )
 
     storage = icechunk.s3_storage(
@@ -252,11 +252,27 @@ def init_ea_store(args):
         logger.error("No OPeNDAP URLs found!")
         return
 
-    # Probe first granule for lat/lon grid
-    logger.info(f"Probing first granule for EA grid: {opendap_urls[0]}")
-    _, lat_ea, lon_ea = read_imerg_opendap_subset(
-        opendap_urls[0], EA_LAT_MIN, EA_LAT_MAX, EA_LON_MIN, EA_LON_MAX
-    )
+    # Download and probe first granule for lat/lon grid
+    import earthaccess
+    import tempfile
+
+    logger.info("Downloading first granule to probe EA grid...")
+    probe_dir = tempfile.mkdtemp(prefix="imerg_probe_")
+    probe_files = earthaccess.download([results[0]], probe_dir)
+    logger.info(f"  Probing: {probe_files[0]}")
+    import netCDF4 as nc4
+    nc = nc4.Dataset(str(probe_files[0]))
+    grp = nc.groups["Grid"] if "Grid" in nc.groups else nc
+    lat_all = grp.variables["lat"][:]
+    lon_all = grp.variables["lon"][:]
+    nc.close()
+    lat_mask = (lat_all >= EA_LAT_MIN) & (lat_all <= EA_LAT_MAX)
+    lon_mask = (lon_all >= EA_LON_MIN) & (lon_all <= EA_LON_MAX)
+    lat_ea = lat_all[lat_mask]
+    lon_ea = lon_all[lon_mask]
+    # Cleanup probe
+    import shutil
+    shutil.rmtree(probe_dir, ignore_errors=True)
     n_lat = len(lat_ea)
     n_lon = len(lon_ea)
     logger.info(f"  EA lat: {n_lat} pts [{lat_ea[0]:.2f} .. {lat_ea[-1]:.2f}]")
@@ -349,16 +365,12 @@ def init_ea_store(args):
 # --- Phase 2: fill ---
 
 
-def _read_imerg_granule_ea(url_info):
-    """Read one IMERG granule via OPeNDAP, subset to EA, return numpy.
-
-    Standalone function so it can be serialized to Dask workers.
-    """
+def _read_imerg_file_ea(idx, file_path):
+    """Read a downloaded IMERG NetCDF file, subset to EA, return numpy."""
     import netCDF4 as nc4
     import numpy as np
 
-    idx, url = url_info
-    nc = nc4.Dataset(url)
+    nc = nc4.Dataset(str(file_path))
 
     if "Grid" in nc.groups:
         grp = nc.groups["Grid"]
@@ -402,15 +414,18 @@ def _write_result_to_icechunk(session, result):
 
 
 def fill_ea_store(args):
-    """Fill EA template with data from OPeNDAP.
+    """Fill EA template with IMERG data.
 
-    Uses Dask/Coiled cluster when --no-cluster is not set, otherwise
-    processes sequentially (useful for local testing with small date ranges).
+    Downloads granules via earthaccess, reads with netcdf4-python, subsets
+    to EA, writes to Icechunk. Uses Coiled cluster unless --no-cluster.
     """
+    import earthaccess
     import icechunk
+    import tempfile
+    from pathlib import Path
 
     logger.info("=" * 60)
-    logger.info("FILL: Populating IMERG EA store via OPeNDAP")
+    logger.info("FILL: Populating IMERG EA store (download + netcdf4 subset)")
     logger.info("=" * 60)
     overall_start = time.time()
 
@@ -418,11 +433,10 @@ def fill_ea_store(args):
     authenticate_earthdata()
     results, opendap_urls = search_imerg_daily(args.start_date, args.end_date)
 
-    if not opendap_urls:
-        logger.error("No OPeNDAP URLs found!")
+    n_granules = len(results)
+    if n_granules == 0:
+        logger.error("No granules found!")
         return
-
-    n_granules = len(opendap_urls)
     logger.info(f"  {n_granules} granules to process")
 
     # Open target Icechunk store + resume detection
@@ -456,21 +470,24 @@ def fill_ea_store(args):
     if start_idx > 0:
         logger.info(f"  Resuming from granule {start_idx} (0-{completed_up_to} done)")
 
-    remaining = list(enumerate(opendap_urls))[start_idx:]
-    if not remaining:
+    remaining_results = list(enumerate(results))[start_idx:]
+    if not remaining_results:
         logger.info("  All granules already filled!")
         return {"status": "success", "message": "already complete"}
-    logger.info(f"  Remaining: {len(remaining)} granules")
+    logger.info(f"  Remaining: {len(remaining_results)} granules")
 
     COMMIT_BATCH = args.commit_batch
     total_written = 0
     total_failed = 0
     failed_indices = []
-
     use_cluster = not getattr(args, "no_cluster", False)
 
+    # Download directory
+    download_dir = Path(args.download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
+
     if use_cluster:
-        # --- Coiled cluster path ---
+        # --- Coiled cluster path: download locally, scatter files to workers ---
         import coiled
         import distributed
 
@@ -488,41 +505,47 @@ def fill_ea_store(args):
         client.wait_for_workers(n_workers=min(5, n_workers), timeout=300)
         logger.info(f"  Cluster ready: {client.dashboard_link}")
 
-        for batch_start in range(0, len(remaining), COMMIT_BATCH):
-            batch = remaining[batch_start: batch_start + COMMIT_BATCH]
+        for batch_start in range(0, len(remaining_results), COMMIT_BATCH):
+            batch = remaining_results[batch_start: batch_start + COMMIT_BATCH]
             batch_idx_min = batch[0][0]
             batch_idx_max = batch[-1][0]
             logger.info(
                 f"  Batch: granules {batch_idx_min}-{batch_idx_max} "
-                f"({len(batch)} granules, {total_written}/{len(remaining)} done)"
+                f"({len(batch)} granules, {total_written}/{len(remaining_results)} done)"
             )
 
+            # Download batch
+            batch_results_only = [r for _, r in batch]
+            downloaded = earthaccess.download(batch_results_only, str(download_dir))
+            logger.info(f"    Downloaded {len(downloaded)} files")
+
+            # Submit reads to cluster
             futures = {}
-            for url_info in batch:
+            for (idx, _), fpath in zip(batch, downloaded):
                 future = client.submit(
-                    _read_imerg_granule_ea, url_info,
-                    key=f"imerg-{url_info[0]}",
+                    _read_imerg_file_ea, idx, fpath,
+                    key=f"imerg-{idx}",
                 )
-                futures[future] = url_info
+                futures[future] = idx
 
             session = target_repo.writable_session("main")
             batch_ok = 0
             batch_fail = 0
 
             for future in distributed.as_completed(futures):
-                url_info = futures[future]
+                idx = futures[future]
                 try:
                     result = future.result()
                     _write_result_to_icechunk(session, result)
                     del result
                     batch_ok += 1
                     total_written += 1
-                    logger.info(f"    Wrote granule {url_info[0]}")
+                    logger.info(f"    Wrote granule {idx}")
                 except Exception as e:
                     batch_fail += 1
                     total_failed += 1
-                    failed_indices.append(url_info[0])
-                    logger.error(f"    Granule {url_info[0]} FAILED: {e}")
+                    failed_indices.append(idx)
+                    logger.error(f"    Granule {idx} FAILED: {e}")
 
             if batch_fail == 0:
                 session.commit(
@@ -543,32 +566,37 @@ def fill_ea_store(args):
         # --- Sequential local path (no cluster) ---
         logger.info("  Running sequentially (--no-cluster)")
 
-        for batch_start in range(0, len(remaining), COMMIT_BATCH):
-            batch = remaining[batch_start: batch_start + COMMIT_BATCH]
+        for batch_start in range(0, len(remaining_results), COMMIT_BATCH):
+            batch = remaining_results[batch_start: batch_start + COMMIT_BATCH]
             batch_idx_min = batch[0][0]
             batch_idx_max = batch[-1][0]
             logger.info(
                 f"  Batch: granules {batch_idx_min}-{batch_idx_max} "
-                f"({len(batch)} granules, {total_written}/{len(remaining)} done)"
+                f"({len(batch)} granules, {total_written}/{len(remaining_results)} done)"
             )
+
+            # Download batch
+            batch_results_only = [r for _, r in batch]
+            downloaded = earthaccess.download(batch_results_only, str(download_dir))
+            logger.info(f"    Downloaded {len(downloaded)} files")
 
             session = target_repo.writable_session("main")
             batch_ok = 0
             batch_fail = 0
 
-            for url_info in batch:
+            for (idx, _), fpath in zip(batch, downloaded):
                 try:
-                    result = _read_imerg_granule_ea(url_info)
+                    result = _read_imerg_file_ea(idx, fpath)
                     _write_result_to_icechunk(session, result)
                     del result
                     batch_ok += 1
                     total_written += 1
-                    logger.info(f"    Wrote granule {url_info[0]}")
+                    logger.info(f"    Wrote granule {idx}")
                 except Exception as e:
                     batch_fail += 1
                     total_failed += 1
-                    failed_indices.append(url_info[0])
-                    logger.error(f"    Granule {url_info[0]} FAILED: {e}")
+                    failed_indices.append(idx)
+                    logger.error(f"    Granule {idx} FAILED: {e}")
 
             if batch_fail == 0:
                 session.commit(
@@ -696,6 +724,8 @@ def main():
                         help="Number of granules per Icechunk commit batch")
     p_fill.add_argument("--no-cluster", action="store_true",
                         help="Run sequentially without Coiled (for local testing)")
+    p_fill.add_argument("--download-dir", type=str, default="./imerg_downloads",
+                        help="Directory for downloaded IMERG files")
 
     # -- verify --
     p_verify = sub.add_parser("verify", help="Inspect store contents")
