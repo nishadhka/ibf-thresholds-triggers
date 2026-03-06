@@ -269,7 +269,8 @@ def worker_read_thredds_day(day_info):
     ).load()
     ds.close()
 
-    # Data comes as (time, lat, lon) from THREDDS — no transpose needed
+    # IMERG native order in THREDDS is (time, lon, lat) — transpose to (time, lat, lon)
+    subset = subset.transpose("time", "lat", "lon")
     data = subset.values.astype(np.float32)
     n_t = data.shape[0]
 
@@ -480,11 +481,13 @@ def fill_store(args):
 
     logger.info(f"  Mapped {len(day_infos)} days to template indices")
 
-    # Resume detection
+    # Resume detection — only consider commits after the most recent init
     completed_indices = set()
     try:
         for commit in target_repo.ancestry(branch="main"):
             msg = commit.message
+            if msg.startswith("initialize "):
+                break  # stop at last init — earlier commits are stale
             if msg.startswith("fill batch "):
                 try:
                     range_str = msg.split(":")[0].replace("fill batch ", "")
