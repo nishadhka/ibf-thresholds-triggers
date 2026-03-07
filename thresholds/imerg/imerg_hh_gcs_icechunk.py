@@ -261,13 +261,26 @@ def worker_read_thredds_day(day_info):
         cookie_jar.touch()
         cookie_jar.chmod(0o600)
 
-    # Open THREDDS ncml via OPeNDAP — server-side subset
-    ds = xr.open_dataset(url, engine="netcdf4", decode_timedelta=False)
-    subset = ds["precipitation"].sel(
-        lat=slice(lat_min, lat_max),
-        lon=slice(lon_min, lon_max),
-    ).load()
-    ds.close()
+    # Open THREDDS ncml via OPeNDAP — server-side subset (with retry)
+    import random
+    import time as _time
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            ds = xr.open_dataset(url, engine="netcdf4", decode_timedelta=False)
+            subset = ds["precipitation"].sel(
+                lat=slice(lat_min, lat_max),
+                lon=slice(lon_min, lon_max),
+            ).load()
+            ds.close()
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 2)
+                _time.sleep(wait)
+            else:
+                raise
 
     # IMERG native order in THREDDS is (time, lon, lat) — transpose to (time, lat, lon)
     subset = subset.transpose("time", "lat", "lon")
@@ -616,16 +629,17 @@ def fill_store(args):
                     failed_days.append(d_info["day"])
                     logger.error(f"    Day {d_info['day']} FAILED: {e}")
 
-        if batch_fail == 0:
+        if batch_ok > 0:
             session.commit(
                 f"fill batch {batch_idx_min}-{batch_idx_max}: "
                 f"{batch_ok}/{len(batch)} OK"
             )
-            logger.info(f"  Committed batch {batch[0]['day']}..{batch[-1]['day']}")
-        else:
-            logger.warning(
-                f"  Batch had {batch_fail} failures, NOT committed — retry on resume"
+            logger.info(
+                f"  Committed batch {batch[0]['day']}..{batch[-1]['day']} "
+                f"({batch_ok} OK, {batch_fail} failed)"
             )
+        else:
+            logger.warning(f"  Batch all failed, nothing to commit")
 
     if use_cluster:
         client.close()
@@ -727,7 +741,7 @@ def main():
     p_fill.add_argument("--start-date", type=str, required=True)
     p_fill.add_argument("--end-date", type=str, required=True)
     p_fill.add_argument("--gcs-prefix", **gcs_args["gcs_prefix"])
-    p_fill.add_argument("--n-workers", type=int, default=20)
+    p_fill.add_argument("--n-workers", type=int, default=10)
     p_fill.add_argument("--commit-batch", type=int, default=10,
                         help="Days per commit batch (default 10)")
     p_fill.add_argument("--no-cluster", action="store_true",
