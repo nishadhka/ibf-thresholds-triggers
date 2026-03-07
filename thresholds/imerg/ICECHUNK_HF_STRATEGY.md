@@ -202,15 +202,80 @@ uv run --python 3.12 plot_imerg_ea.py \
     --outdir ./plots
 ```
 
+## GCS → HuggingFace transfer: rate limit issue (tested 2026-03-07)
+
+### Problem
+
+HuggingFace enforces a **128 commits per hour** rate limit on dataset repos.
+The GCS Icechunk store (`gs://cpc_awc/ea_imerg_ic_store`) contains **12,158
+objects (11.83 GB)** — mostly chunk files in the 0.5–2.0 MB range.
+
+Two transfer approaches were tested:
+
+| Approach | Method | Result |
+|----------|--------|--------|
+| Streaming GCS→HF | `create_commit()` with 50-file batches | 6,400/12,158 uploaded (52.6%), then **429 Too Many Requests** — hit 128 commits/hour |
+| Local staging + `upload_large_folder()` | Download GCS→local (12 GB), then bulk upload | Requires 12 GB local disk; `upload_large_folder()` handles rate limits but still constrained by the same 128 commits/hour |
+
+### Rate limit details
+
+```
+429 Too Many Requests: you have exceeded the rate limit for repository
+commits (128 per hour). You can retry this action in 43 minutes.
+```
+
+- Free HF accounts: 128 commits/hour, 1000 API requests per 5-minute window
+- Each batch commit counts as 1 commit regardless of file count
+- With 50 files/commit: 128 × 50 = 6,400 files/hour → full upload needs ~2 hours
+- With `upload_large_folder()`: handles rate limit waiting internally but same throughput
+
+### Store size breakdown
+
+| Subdirectory | Files | Size |
+|-------------|-------|------|
+| chunks | 11,239 | 11.80 GB |
+| manifests | 307 | 30.5 MB |
+| snapshots | 306 | 0.4 MB |
+| transactions | 305 | 0.1 MB |
+| refs | 1 | < 1 KB |
+
+### Options for completing the transfer
+
+1. **Wait and retry** — run `gcs_to_hf_transfer.py --skip-download` after the
+   rate limit resets (~43 min); `upload_large_folder()` resumes from where it
+   stopped. May need 2-3 hourly runs to complete all 12,158 files.
+
+2. **HuggingFace Pro/paid plan** — higher rate limits for commits.
+
+3. **Keep data on GCS only** — the store is fully accessible at
+   `gs://cpc_awc/ea_imerg_ic_store` via Icechunk's `gcs_storage()`. HF upload
+   is for free public distribution but not strictly required for analysis.
+
+4. **Use `gsutil rsync` to a GCS-hosted HF-compatible endpoint** — not currently
+   supported by Icechunk.
+
+### Current status
+
+The partial upload (6,400 files, 52.6%) is live at:
+```
+https://huggingface.co/datasets/E4DRR/icechunk-stores/tree/main/ea_imerg_ic_store
+```
+This is **not a functional Icechunk store** — missing chunks will cause read
+errors. Either complete the upload or delete the partial data from HF.
+
 ## Summary
 
 | Scenario | Backend | Cluster | Upload to HF | Validated |
 |----------|---------|---------|--------------|-----------|
-| Initial backfill (2000-2024) | GCS Icechunk | Coiled 10-20 workers | After completion | Pending (needs GCS SA) |
+| Initial backfill (2000-2024) | GCS Icechunk | Coiled 10 workers | Partial (52.6%, rate limited) | Yes — 9,315 days, 11.83 GB |
 | Daily/weekly updates | Local Icechunk | None (sequential) | After each update | Yes (test3) |
-| Read access (consumers) | HuggingFace | N/A | N/A | Yes |
+| Read access (consumers) | GCS Icechunk | N/A | N/A | Yes |
 
 The key insight: **use the right tool for each phase**. GCS + Dask for heavy
 writes, local + sequential for light updates, HuggingFace for free public
 distribution. No need to force direct HF writes — it is not technically possible
 and the two-phase approach is more robust.
+
+**Note:** HuggingFace's 128 commits/hour rate limit makes large store uploads
+slow but not impossible — plan for multi-hour transfer windows or use
+`upload_large_folder()` which handles retries automatically.
