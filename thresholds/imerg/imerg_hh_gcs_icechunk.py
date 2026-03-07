@@ -529,15 +529,14 @@ def fill_store(args):
         logger.info(f"  Launching Coiled cluster with {n_workers} workers...")
         cluster = coiled.Cluster(
             name=f"imerg-hh-thredds-{int(time.time()) % 10000}",
-            n_workers=[min(5, n_workers), n_workers],
+            n_workers=n_workers,
             worker_vm_types="n2-standard-4",
             package_sync=True,
             region=COILED_REGION,
             workspace=COILED_WORKSPACE,
-            idle_timeout="30 minutes",
         )
         client = distributed.Client(cluster)
-        client.wait_for_workers(n_workers=min(5, n_workers), timeout=300)
+        client.wait_for_workers(n_workers=n_workers, timeout=300)
         logger.info(f"  Cluster ready: {client.dashboard_link}")
 
     # Process in batches (days per commit)
