@@ -61,7 +61,7 @@ THREDDS ncml (GES DISC)                              GCS Icechunk
   ├── day1.ncml ──► Worker 1 ──subset──► numpy ──┐   gs://cpc_awc/
   ├── day2.ncml ──► Worker 2 ──subset──► numpy ──┤   ea_imerg_ic_store
   ├── day3.ncml ──► Worker 3 ──subset──► numpy ──┤        │
-  └── ...          (20 Coiled workers)           └──► Coordinator
+  └── ...          (5-10 Coiled workers)          └──► Coordinator
                                                       writes + commits
                                                            │
                                                       sync to HF
@@ -118,18 +118,23 @@ uv run --python 3.12 imerg_hh_gcs_icechunk.py init \
     --start-date 2024-12-01 --end-date 2024-12-31 \
     --gcs-prefix test_ea_imerg_ic_store
 
-# Production: full archive
+# Production: full archive (Jun 2000 – Dec 2025)
 uv run --python 3.12 imerg_hh_gcs_icechunk.py init \
-    --start-date 2000-06-01 --end-date 2025-03-01
+    --start-date 2000-06-01 --end-date 2025-12-01
 ```
 
 ### 2. Fill via THREDDS with Coiled workers
 
 ```bash
-# Test: 1 month, 20 workers
+# Test: 1 month, 10 workers
 uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
     --start-date 2024-12-01 --end-date 2024-12-31 \
-    --gcs-prefix test_ea_imerg_ic_store --n-workers 20
+    --gcs-prefix test_ea_imerg_ic_store --n-workers 10
+
+# Production: full archive (supports resume — re-run to fill gaps)
+uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
+    --start-date 2000-06-01 --end-date 2025-12-01 \
+    --n-workers 10 --commit-batch 30
 
 # Sequential (no cluster, for debugging)
 uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
@@ -142,6 +147,40 @@ uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
 ```bash
 uv run --python 3.12 imerg_hh_gcs_icechunk.py verify \
     --gcs-prefix test_ea_imerg_ic_store
+
+# Production store
+uv run --python 3.12 imerg_hh_gcs_icechunk.py verify
+```
+
+### 4. Monitor backfill progress
+
+The fill command logs to `imerg_hh_gcs_icechunk.log`. Monitor with:
+
+```bash
+# Watch live progress
+tail -f imerg_hh_gcs_icechunk.log
+
+# Count committed batches and failures
+grep "Committed batch" imerg_hh_gcs_icechunk.log | wc -l
+grep "FAILED" imerg_hh_gcs_icechunk.log | wc -l
+
+# See latest committed batch and progress
+grep "Committed batch" imerg_hh_gcs_icechunk.log | tail -3
+grep "done)" imerg_hh_gcs_icechunk.log | tail -1
+
+# Show batches with partial failures
+grep "failed)" imerg_hh_gcs_icechunk.log | grep -v "0 failed"
+
+# List all failed days (for targeted re-fill)
+grep "FAILED" imerg_hh_gcs_icechunk.log | sed 's/.*Day \(.*\) FAILED.*/\1/' | sort -u
+```
+
+Coiled dashboard (requires `bokeh>=3.1.0`):
+
+```bash
+pip install "bokeh>=3.1.0"
+# Dashboard URL printed at cluster startup in logs
+grep "Cluster ready" imerg_hh_gcs_icechunk.log
 ```
 
 ## Usage: Daily Early pipeline (local/HF)
@@ -196,7 +235,7 @@ backend does not support the atomic object operations Icechunk needs. See
 
 | Scenario | Write backend | Cluster | Then upload to HF |
 |----------|---------------|---------|-------------------|
-| Backfill (2000-2025) | GCS Icechunk | Coiled 20 workers | After completion |
+| Backfill (2000-2025) | GCS Icechunk | Coiled 5-10 workers | After completion |
 | Daily/weekly updates | Local Icechunk | None (sequential) | After each fill |
 | Read access | HuggingFace | N/A | N/A |
 
@@ -251,6 +290,17 @@ Result: xr.open_dataset() → server-side subset → (48, 345, 400) loaded
         Works from GCP, no rate limiting on single connection
 ```
 
+### Test 6: THREDDS + GCS + Coiled (10 workers, 1 month) — passed
+
+```
+Init:   (1488, 400, 345) on gs://cpc_awc/test_ea_imerg_ic_store
+Fill:   31 days via THREDDS ncml, 10 Coiled workers (5-10 adaptive)
+        31/31 OK, 0 failures, ~5 min data + 3 min cluster startup
+Verify: 6,624,000 valid values, min=0.0, max=41.39, mean=0.087 mm/hr
+Fixes:  Transpose THREDDS (time, lon, lat) → (time, lat, lon) for template
+        Resume detection stops at latest init commit
+```
+
 ### S3 direct access test — blocked from GCP
 
 ```
@@ -268,28 +318,83 @@ Error:  AccessDenied — role s3-same-region-access-role has explicit deny
 | `test2_imerg-v7-ea-store` | IMERG HH Final | 2024-12-01 (48 HH) | 1-day test |
 | `test3_imerg-update-test` | IMERG Daily Early | 2024-12-01 to 2024-12-14 | Incremental test |
 
-GCS store: `gs://cpc_awc/test_ea_imerg_ic_store` (Dec 2024 HH template)
+GCS stores:
+
+| Store | Product | Period | Shape | Status |
+|-------|---------|--------|-------|--------|
+| `gs://cpc_awc/ea_imerg_ic_store` | IMERG HH Final | 2000-06-01 to 2025-12-01 | `(447120, 400, 345)` | Backfill in progress |
+| `gs://cpc_awc/test_ea_imerg_ic_store` | IMERG HH Final | 2024-12-01 to 2024-12-31 | `(1488, 400, 345)` | Complete (test) |
 
 All HF stores at: https://huggingface.co/datasets/E4DRR/icechunk-stores
 
+## Production backfill status
+
+**Store**: `gs://cpc_awc/ea_imerg_ic_store`
+**Template**: `(447,120, 400, 345)` — 9,315 days × 48 HH × 400 lat × 345 lon = ~230 GB
+
+### Run 1 — no retries (2026-03-06)
+
+```
+Workers:   5 adaptive (Coiled, n2-standard-4, us-east1)
+Batches:   85 committed, 1628 failures
+Result:    ~2,550 days committed (many batches dropped due to failures)
+Duration:  ~3.5 hours
+Issue:     No retry logic — THREDDS DAP errors caused entire batches to be dropped
+           Server returns HTML error pages when rate-limited (NASA IT Security Banner)
+```
+
+### Run 2 — with retries + partial commits (2026-03-07, in progress)
+
+```
+Workers:   5-10 adaptive (Coiled, n2-standard-4, us-east1)
+Batches:   100+ committed, ~300 failures
+Result:    Filling gaps from run 1 + continuing through 2025
+Duration:  ~8+ hours estimated
+Fixes:     5 retries with exponential backoff + jitter per worker
+           Partial batch commits (save successful days even if some fail)
+           Resume detection stops at latest init (ignores stale pre-init commits)
+```
+
+### Backfill resilience
+
+The pipeline handles transient THREDDS failures gracefully:
+
+- **Worker retries**: 5 attempts with exponential backoff (1s, 2s, 4s, 8s + jitter)
+- **Partial commits**: if 27/30 days succeed, those 27 are committed; 3 failures retry on resume
+- **Resume detection**: re-run the same fill command to pick up failed days
+- **Idempotent**: safe to run multiple times — already-filled days are skipped
+
+After the initial backfill, run fill again to pick up any remaining gaps:
+
+```bash
+# Resume — automatically skips committed days
+uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
+    --start-date 2000-06-01 --end-date 2025-12-01 \
+    --n-workers 10 --commit-batch 30
+```
+
 ## Way forward
 
-1. **Test THREDDS + GCS pipeline** (next step)
-   - Run `imerg_hh_gcs_icechunk.py` fill with THREDDS + 20 Coiled workers
-   - 1-month test on `test_ea_imerg_ic_store`, then full 2000-2025 archive
+1. **Complete backfill** (in progress)
+   - Fill remaining days from 2000-06 to 2025-12
+   - Re-run to fill gaps from THREDDS transient failures
+   - Verify full store
 
-2. **Full archive backfill (2000-06 to present)**
-   - ~9,500 days × 48 HH steps = ~456,000 timesteps
-   - 20 workers reading THREDDS, coordinator writing to GCS Icechunk
-   - Upload completed store to HF
+2. **Upload to HuggingFace**
+   - Sync completed GCS store to HF for public distribution
+   - `huggingface_hub.upload_folder()` for initial upload
 
 3. **Operational daily/weekly updates**
    - Sequential `--no-cluster` fill via THREDDS (1 day in ~5s)
    - Upload delta to HF
 
-4. **Rechunk for time-series access**
+4. **IMERG Early (near-real-time)**
+   - `GPM_3IMERGHHE` for data beyond Final's ~3.5 month latency
+   - Separate pipeline or extend current script with `--product early`
+
+5. **Rechunk for time-series access**
    - Add a `rechunk` subcommand (like CMORPH pipeline)
    - Target pencil chunks: full-time x 5-lat x 5-lon for fast point queries
 
-5. **Integration with thresholds pipeline**
+6. **Integration with thresholds pipeline**
    - Use the Icechunk store as input for GEV return period analysis
