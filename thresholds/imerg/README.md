@@ -4,6 +4,19 @@ Processes GPM IMERG precipitation data (Daily Early + Half-Hourly Final),
 subsets to East Africa, and stores in Icechunk repositories on GCS and
 HuggingFace ([E4DRR/icechunk-stores](https://huggingface.co/datasets/E4DRR/icechunk-stores)).
 
+
+
+  ┌─────────┬───────────────┬────────────┬──────────────────────────────────┐
+  │ Product │  Short name   │  Latency   │             Quality              │
+  ├─────────┼───────────────┼────────────┼──────────────────────────────────┤
+  │ Early   │ GPM_3IMERGHHE │ ~4 hours   │ Near-real-time, lower quality    │
+  ├─────────┼───────────────┼────────────┼──────────────────────────────────┤
+  │ Late    │ GPM_3IMERGHHL │ ~14 hours  │ Intermediate                     │
+  ├─────────┼───────────────┼────────────┼──────────────────────────────────┤
+  │ Final   │ GPM_3IMERGHH  │ ~3.5       │ Research-quality,                │
+  │         │               │ months     │ gauge-calibrated                 │
+  └─────────┴───────────────┴────────────┴──────────────────────────────────┘
+  
 ## Data access methods tested
 
 Three approaches were tested for accessing IMERG data from NASA GES DISC.
@@ -97,10 +110,13 @@ hf=hf_your_token_here
 
 | Script | Purpose |
 |--------|---------|
-| `imerg_hh_gcs_icechunk.py` | **Production**: THREDDS → Coiled → GCS Icechunk |
+| `imerg_hh_gcs_icechunk.py` | **Production**: THREDDS → Coiled → GCS Icechunk (Final/Late/Early) |
 | `imerg_daily_ea_icechunk.py` | Daily Early pipeline: init → fill → verify (local/HF) |
 | `imerg_hh_ea_icechunk.py` | Half-hourly HTTPS download pipeline (local/HF) |
 | `plot_imerg_ea.py` | Plot precipitation maps from local or HuggingFace store |
+| `plot_imerg_gcs_sample.py` | Plot random days from GCS Icechunk store |
+| `check_missing_days.py` | Scan GCS store for missing/empty days |
+| `gcs_to_hf_transfer.py` | Transfer GCS store to HuggingFace (rate-limit aware) |
 | `test_hf_icechunk.py` | Upload local store to HF, with safety checks |
 | `download_imerg_daily.py` | Simple 7-day download script (standalone) |
 | `ICECHUNK_HF_STRATEGY.md` | Architecture: why HF direct writes fail, GCS+HF strategy |
@@ -373,24 +389,80 @@ uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
     --n-workers 10 --commit-batch 30
 ```
 
+## Multi-product quality cascade (Final → Late → Early)
+
+The store supports all three IMERG products in a single Icechunk repository.
+Each product fills the same time slots but at different quality levels:
+
+```
+  Product    Short name       Latency    Quality   Priority
+  ─────────  ───────────────  ─────────  ────────  ────────
+  Final      GPM_3IMERGHH     ~3.5 mo    Highest   3
+  Late       GPM_3IMERGHHL    ~14 hrs    Medium    2
+  Early      GPM_3IMERGHHE    ~4 hrs     Lowest    1
+```
+
+### How it works
+
+- **Commit tagging**: each fill commit includes the product tag:
+  `fill batch 123-456 [GPM_3IMERGHHE]: 30/30 OK`
+- **Quality-aware resume**: when filling with a product, days already filled
+  by the same or higher quality product are skipped. Days filled by a lower
+  quality product are overwritten.
+- **Iterative replacement**: as Final data becomes available (~3.5 months
+  after observation), re-run fill with `--product final` to replace
+  Late/Early data with research-quality Final data.
+
+### Usage: bring the store up to today
+
+```bash
+# Step 1: Extend the template to cover through today
+uv run --python 3.12 imerg_hh_gcs_icechunk.py extend \
+    --end-date 2026-03-08
+
+# Step 2: Fill with Late data (available up to ~14 hours ago)
+#   Only fills days not already covered by Final
+uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
+    --start-date 2025-12-02 --end-date 2026-03-06 \
+    --product late --no-cluster --commit-batch 7
+
+# Step 3: Fill remaining days with Early data (up to ~4 hours ago)
+uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
+    --start-date 2026-03-07 --end-date 2026-03-08 \
+    --product early --no-cluster --commit-batch 1
+
+# Step 4 (later): When Final data is released, replace Late/Early
+uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
+    --start-date 2025-12-02 --end-date 2026-03-08 \
+    --product final --no-cluster --commit-batch 30
+```
+
+### Icechunk commit history example
+
+```
+fill batch 447168-447216 [GPM_3IMERGHHE]: 1/1 OK     ← Early for today
+fill batch 446784-447120 [GPM_3IMERGHHL]: 7/7 OK     ← Late for last week
+fill batch 0-1440 [GPM_3IMERGHH]: 30/30 OK           ← Final for 2000-06
+initialize IMERG HH EA template
+```
+
+When `--product final` is re-run later, it overwrites the Early/Late slots
+because Final (quality=3) > Late (quality=2) > Early (quality=1). Days
+already filled by Final are skipped.
+
 ## Way forward
 
-1. **Complete backfill** (in progress)
-   - Fill remaining days from 2000-06 to 2025-12
-   - Re-run to fill gaps from THREDDS transient failures
-   - Verify full store
+1. **Backfill complete** — 9,315 days (2000-06 to 2025-12) filled with Final data
 
-2. **Upload to HuggingFace**
-   - Sync completed GCS store to HF for public distribution
-   - `huggingface_hub.upload_folder()` for initial upload
+2. **Extend to present** — use `extend` + `fill --product late/early` to
+   bring the store from 2025-12-01 up to today
 
-3. **Operational daily/weekly updates**
-   - Sequential `--no-cluster` fill via THREDDS (1 day in ~5s)
-   - Upload delta to HF
+3. **Upload to HuggingFace** — rate-limited to 128 commits/hour; use
+   `gcs_to_hf_transfer.py` with `upload_large_folder()` for automatic
+   rate limit handling (see `ICECHUNK_HF_STRATEGY.md`)
 
-4. **IMERG Early (near-real-time)**
-   - `GPM_3IMERGHHE` for data beyond Final's ~3.5 month latency
-   - Separate pipeline or extend current script with `--product early`
+4. **Operational updates** — daily `--no-cluster` fill with Early/Late,
+   periodic Final replacement as data becomes available
 
 5. **Rechunk for time-series access**
    - Add a `rechunk` subcommand (like CMORPH pipeline)

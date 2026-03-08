@@ -91,9 +91,17 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 
-IMERG_SHORT_NAME = "GPM_3IMERGHH"
-IMERG_VERSION = "07"
 IMERG_VAR = "precipitation"
+
+# IMERG product hierarchy: Final > Late > Early
+# Higher quality products should replace lower quality ones
+IMERG_PRODUCTS = {
+    "final": {"short_name": "GPM_3IMERGHH", "version": "07", "label": "Final"},
+    "late":  {"short_name": "GPM_3IMERGHHL", "version": "07", "label": "Late"},
+    "early": {"short_name": "GPM_3IMERGHHE", "version": "07", "label": "Early"},
+}
+PRODUCT_QUALITY = {"final": 3, "late": 2, "early": 1}
+DEFAULT_PRODUCT = "final"
 
 # East Africa bounding box (expanded)
 EA_LAT_MIN = -14.5
@@ -104,7 +112,6 @@ EA_BBOX = (EA_LON_MIN, EA_LAT_MIN, EA_LON_MAX, EA_LAT_MAX)
 
 # THREDDS ncml aggregation base URL
 THREDDS_BASE = "https://gpm1.gesdisc.eosdis.nasa.gov/thredds/dodsC/aggregation"
-THREDDS_COLLECTION = f"{IMERG_SHORT_NAME}.{IMERG_VERSION}"
 
 # GCS Icechunk store
 GCS_BUCKET = "cpc_awc"
@@ -188,15 +195,19 @@ def get_gcs_storage(gcs_prefix):
     return storage
 
 
-def build_thredds_day_urls(start_date: str, end_date: str):
+def build_thredds_day_urls(start_date: str, end_date: str, product: str = DEFAULT_PRODUCT):
     """Build THREDDS ncml OPeNDAP URLs for each day in the date range.
 
     Each ncml file aggregates 48 half-hourly granules for one day.
-    URL pattern: .../aggregation/GPM_3IMERGHH.07/{year}/
-                 GPM_3IMERGHH.07_Aggregation_{year}{doy}.ncml.ncml
+    URL pattern: .../aggregation/{collection}/{year}/
+                 {collection}_Aggregation_{year}{doy}.ncml.ncml
 
+    The collection name varies by product (Final/Late/Early).
     Returns list of (date, url) tuples.
     """
+    prod = IMERG_PRODUCTS[product]
+    collection = f"{prod['short_name']}.{prod['version']}"
+
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
     days = pd.date_range(start, end, freq="D")
@@ -205,11 +216,11 @@ def build_thredds_day_urls(start_date: str, end_date: str):
     for day in days:
         year = day.year
         doy = day.day_of_year
-        ncml_name = f"{THREDDS_COLLECTION}_Aggregation_{year}{doy:03d}.ncml.ncml"
-        url = f"{THREDDS_BASE}/{THREDDS_COLLECTION}/{year}/{ncml_name}"
+        ncml_name = f"{collection}_Aggregation_{year}{doy:03d}.ncml.ncml"
+        url = f"{THREDDS_BASE}/{collection}/{year}/{ncml_name}"
         day_urls.append((day, url))
 
-    logger.info(f"Built {len(day_urls)} THREDDS day URLs: {start_date} to {end_date}")
+    logger.info(f"Built {len(day_urls)} THREDDS day URLs ({product}): {start_date} to {end_date}")
     return day_urls
 
 
@@ -314,7 +325,7 @@ def init_store(args):
 
     authenticate_earthdata()
 
-    day_urls = build_thredds_day_urls(args.start_date, args.end_date)
+    day_urls = build_thredds_day_urls(args.start_date, args.end_date, product=DEFAULT_PRODUCT)
     if not day_urls:
         logger.error("No days in range!")
         return
@@ -366,9 +377,9 @@ def init_store(args):
                 ("time", "lat", "lon"),
                 da.zeros(shape, chunks=shape, dtype=np.float32),
                 {
-                    "long_name": "Half-hourly precipitation rate (Final)",
+                    "long_name": "Half-hourly precipitation rate",
                     "units": "mm/hr",
-                    "source": f"{IMERG_SHORT_NAME} v{IMERG_VERSION}",
+                    "source": "IMERG v07 (Final/Late/Early)",
                     "access_method": "THREDDS ncml OPeNDAP aggregation",
                 },
             ),
@@ -379,8 +390,8 @@ def init_store(args):
             "lon": ("lon", lon_ea.astype(np.float64), {"units": "degrees_east"}),
         },
         attrs={
-            "title": "IMERG Half-Hourly Final — East Africa Subset",
-            "source": f"{IMERG_SHORT_NAME} v{IMERG_VERSION}",
+            "title": "IMERG Half-Hourly — East Africa Subset",
+            "source": "IMERG v07 (Final/Late/Early)",
             "region": "East Africa",
             "bbox": f"[{EA_LON_MIN}, {EA_LAT_MIN}, {EA_LON_MAX}, {EA_LAT_MAX}]",
             "temporal_resolution": "30 minutes",
@@ -441,15 +452,19 @@ def fill_store(args):
     import icechunk
     import xarray as xr
 
+    product = getattr(args, "product", DEFAULT_PRODUCT)
+    prod_info = IMERG_PRODUCTS[product]
+    prod_tag = f"[{prod_info['short_name']}]"
+
     logger.info("=" * 60)
-    logger.info("FILL: THREDDS ncml → Coiled workers → GCS Icechunk")
+    logger.info(f"FILL: THREDDS ncml → GCS Icechunk (product: {product} / {prod_info['short_name']})")
     logger.info("=" * 60)
     overall_start = time.time()
 
     authenticate_earthdata()
     username, password = get_earthdata_credentials()
 
-    day_urls = build_thredds_day_urls(args.start_date, args.end_date)
+    day_urls = build_thredds_day_urls(args.start_date, args.end_date, product=product)
     n_days = len(day_urls)
     if n_days == 0:
         logger.error("No days in range!")
@@ -494,8 +509,12 @@ def fill_store(args):
 
     logger.info(f"  Mapped {len(day_infos)} days to template indices")
 
-    # Resume detection — only consider commits after the most recent init
-    completed_indices = set()
+    # Resume detection — product-quality-aware
+    # Track which indices have been filled and by which product quality level.
+    # Skip indices already filled by same or higher quality product.
+    # Allow overwriting indices filled by a lower quality product.
+    filled_quality = {}  # t_start_idx -> max quality level
+    current_quality = PRODUCT_QUALITY[product]
     try:
         for commit in target_repo.ancestry(branch="main"):
             msg = commit.message
@@ -503,18 +522,38 @@ def fill_store(args):
                 break  # stop at last init — earlier commits are stale
             if msg.startswith("fill batch "):
                 try:
-                    range_str = msg.split(":")[0].replace("fill batch ", "")
+                    # Parse product tag from commit: "fill batch X-Y [GPM_3IMERGHHE]: N/M OK"
+                    commit_quality = 0
+                    for pname, pinfo in IMERG_PRODUCTS.items():
+                        if f"[{pinfo['short_name']}]" in msg:
+                            commit_quality = PRODUCT_QUALITY[pname]
+                            break
+                    if commit_quality == 0:
+                        # Old commits without product tag are assumed Final
+                        commit_quality = PRODUCT_QUALITY["final"]
+
+                    range_part = msg.split("[")[0] if "[" in msg else msg.split(":")[0]
+                    range_str = range_part.replace("fill batch ", "").strip().rstrip("-")
                     b_start, b_end = range_str.split("-")
                     for idx in range(int(b_start), int(b_end) + 1):
-                        completed_indices.add(idx)
+                        filled_quality[idx] = max(filled_quality.get(idx, 0), commit_quality)
                 except (ValueError, IndexError):
                     pass
     except Exception:
         pass
 
-    remaining = [d for d in day_infos if d["t_start_idx"] not in completed_indices]
-    if completed_indices:
-        logger.info(f"  Already filled: {len(completed_indices)} day-start indices")
+    # Skip days already filled by same or higher quality
+    remaining = []
+    for d in day_infos:
+        idx = d["t_start_idx"]
+        existing_q = filled_quality.get(idx, 0)
+        if existing_q >= current_quality:
+            continue  # already filled by same or better product
+        remaining.append(d)
+
+    skip_count = len(day_infos) - len(remaining)
+    if skip_count:
+        logger.info(f"  Already filled (same/higher quality): {skip_count} days")
     if not remaining:
         logger.info("  All days already filled!")
         return
@@ -630,8 +669,8 @@ def fill_store(args):
 
         if batch_ok > 0:
             session.commit(
-                f"fill batch {batch_idx_min}-{batch_idx_max}: "
-                f"{batch_ok}/{len(batch)} OK"
+                f"fill batch {batch_idx_min}-{batch_idx_max} "
+                f"{prod_tag}: {batch_ok}/{len(batch)} OK"
             )
             logger.info(
                 f"  Committed batch {batch[0]['day']}..{batch[-1]['day']} "
@@ -713,6 +752,97 @@ def verify_store(args):
     logger.info("\nVerification complete.")
 
 
+# --- Phase 4: extend ---
+
+
+def extend_store(args):
+    """Extend the template time axis to cover new dates.
+
+    Appends new empty time slots to the existing store without touching
+    existing data. Use this before filling Late/Early data for dates
+    beyond the original template range.
+    """
+    import dask.array as da
+    import icechunk
+    import xarray as xr
+
+    logger.info("=" * 60)
+    logger.info("EXTEND: Growing template time axis")
+    logger.info("=" * 60)
+
+    gcs_prefix = args.gcs_prefix or GCS_PREFIX
+    storage = get_gcs_storage(gcs_prefix)
+    repo = icechunk.Repository.open(
+        storage, config=icechunk.RepositoryConfig.default()
+    )
+    session = repo.readonly_session("main")
+    ds = xr.open_zarr(session.store, consolidated=False)
+
+    current_end = pd.Timestamp(ds.time.values[-1])
+    new_end = pd.Timestamp(args.end_date)
+    lat = ds.lat.values
+    lon = ds.lon.values
+    n_lat = len(lat)
+    n_lon = len(lon)
+
+    logger.info(f"  Current end: {current_end}")
+    logger.info(f"  Requested end: {new_end}")
+
+    if new_end <= current_end:
+        logger.info("  Template already covers this date range, nothing to extend.")
+        return
+
+    # New time slots: from day after current end to new end
+    next_day = (current_end + pd.Timedelta(minutes=30)).normalize()
+    new_times = pd.date_range(next_day, new_end, freq="30min")
+    n_new = len(new_times)
+    if n_new == 0:
+        logger.info("  No new time slots needed.")
+        return
+
+    n_new_days = n_new // 48
+    logger.info(f"  Adding {n_new} time slots ({n_new_days} days)")
+    logger.info(f"  New range: {new_times[0]} to {new_times[-1]}")
+
+    # Create append dataset with empty data
+    shape = (n_new, n_lat, n_lon)
+    chunk_time = min(ZARR_CHUNK_TIME, n_new)
+    chunks = (chunk_time, n_lat, n_lon)
+
+    append_ds = xr.Dataset(
+        {
+            IMERG_VAR: (
+                ("time", "lat", "lon"),
+                da.zeros(shape, chunks=shape, dtype=np.float32),
+            ),
+        },
+        coords={
+            "time": new_times,
+            "lat": ("lat", lat),
+            "lon": ("lon", lon),
+        },
+    )
+
+    # Append to existing store
+    session = repo.writable_session("main")
+    append_ds.to_zarr(
+        session.store,
+        mode="a",
+        append_dim="time",
+        encoding={
+            IMERG_VAR: {
+                "chunks": chunks,
+                "fill_value": float(FILL_VALUE),
+            },
+        },
+        consolidated=False,
+    )
+    session.commit(f"extend template to {args.end_date} (+{n_new_days} days)")
+
+    logger.info(f"  Extended! New total: {ds.sizes['time'] + n_new} time slots")
+    logger.info("=" * 60)
+
+
 # --- CLI ---
 
 
@@ -740,11 +870,21 @@ def main():
     p_fill.add_argument("--start-date", type=str, required=True)
     p_fill.add_argument("--end-date", type=str, required=True)
     p_fill.add_argument("--gcs-prefix", **gcs_args["gcs_prefix"])
+    p_fill.add_argument("--product", type=str, default=DEFAULT_PRODUCT,
+                        choices=list(IMERG_PRODUCTS.keys()),
+                        help="IMERG product: final (default), late, or early")
     p_fill.add_argument("--n-workers", type=int, default=10)
     p_fill.add_argument("--commit-batch", type=int, default=10,
                         help="Days per commit batch (default 10)")
     p_fill.add_argument("--no-cluster", action="store_true",
                         help="Run sequentially without Coiled (for testing)")
+
+    # -- extend --
+    p_extend = sub.add_parser("extend",
+                              help="Extend template time axis to cover new dates")
+    p_extend.add_argument("--end-date", type=str, required=True,
+                          help="New end date (must be after current end)")
+    p_extend.add_argument("--gcs-prefix", **gcs_args["gcs_prefix"])
 
     # -- verify --
     p_verify = sub.add_parser("verify", help="Inspect GCS store contents")
@@ -756,6 +896,8 @@ def main():
         init_store(args)
     elif args.command == "fill":
         fill_store(args)
+    elif args.command == "extend":
+        extend_store(args)
     elif args.command == "verify":
         verify_store(args)
     else:
