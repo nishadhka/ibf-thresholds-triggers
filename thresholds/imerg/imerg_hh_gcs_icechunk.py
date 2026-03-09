@@ -829,12 +829,6 @@ def extend_store(args):
         session.store,
         mode="a",
         append_dim="time",
-        encoding={
-            IMERG_VAR: {
-                "chunks": chunks,
-                "fill_value": float(FILL_VALUE),
-            },
-        },
         consolidated=False,
     )
     session.commit(f"extend template to {args.end_date} (+{n_new_days} days)")
