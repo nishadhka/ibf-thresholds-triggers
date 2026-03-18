@@ -117,6 +117,7 @@ hf=hf_your_token_here
 | `plot_imerg_gcs_sample.py` | Plot random days from GCS Icechunk store |
 | `check_missing_days.py` | Scan GCS store for missing/empty days |
 | `gcs_to_hf_transfer.py` | Transfer GCS store to HuggingFace (rate-limit aware) |
+| `gcs_to_source_coop_transfer.py` | Transfer GCS store to source.coop S3 (batched, ~12 GB) |
 | `test_hf_icechunk.py` | Upload local store to HF, with safety checks |
 | `download_imerg_daily.py` | Simple 7-day download script (standalone) |
 | `ICECHUNK_HF_STRATEGY.md` | Architecture: why HF direct writes fail, GCS+HF strategy |
@@ -470,3 +471,59 @@ already filled by Final are skipped.
 
 6. **Integration with thresholds pipeline**
    - Use the Icechunk store as input for GEV return period analysis
+
+## source.coop (public S3 access)
+
+The IMERG HH store is published to [source.coop](https://source.coop) at:
+
+```
+s3://us-west-2.opendata.source.coop/e4drr-project/observations/imerg_hh_icechunk/
+```
+
+### Read access (no credentials needed)
+
+```python
+import icechunk
+import xarray as xr
+
+storage = icechunk.s3_storage(
+    bucket="us-west-2.opendata.source.coop",
+    prefix="e4drr-project/observations/imerg_hh_icechunk",
+    region="us-west-2",
+    anonymous=True,
+)
+repo = icechunk.Repository.open(
+    storage, config=icechunk.RepositoryConfig.default()
+)
+session = repo.readonly_session("main")
+ds = xr.open_zarr(session.store, consolidated=False)
+print(ds)
+```
+
+### Transfer from GCS to source.coop
+
+The store is ~12 GB / 12,000+ objects. `gcs_to_source_coop_transfer.py`
+downloads in batches (default 2 GB each) to work within temporary credential
+time limits:
+
+```bash
+# Set credentials in .env or environment
+export SOURCE_COOP_ACCESS_KEY_ID=...    # or AWS_ACCESS_KEY_ID
+export SOURCE_COOP_SECRET_ACCESS_KEY=... # or AWS_SECRET_ACCESS_KEY
+export SOURCE_COOP_SESSION_TOKEN=...     # or AWS_SESSION_TOKEN
+
+# Dry run — show batches and sizes
+uv run gcs_to_source_coop_transfer.py --dry-run
+
+# Full transfer (download + upload in batches)
+uv run gcs_to_source_coop_transfer.py
+
+# Resume upload only (skip download)
+uv run gcs_to_source_coop_transfer.py --skip-download
+
+# Verify uploaded store
+uv run gcs_to_source_coop_transfer.py --verify
+
+# Custom batch size
+uv run gcs_to_source_coop_transfer.py --batch-gb 1.5
+```

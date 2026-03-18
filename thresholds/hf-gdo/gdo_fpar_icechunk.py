@@ -78,6 +78,9 @@ EA_LON_MAX = 54.0
 GCS_BUCKET = "cpc_awc"
 GCS_PREFIX = "gdo_fpar_ic_store"
 
+SOURCE_COOP_BUCKET = "us-west-2.opendata.source.coop"
+SOURCE_COOP_PREFIX = "e4drr-project/observations/gdo_fpar_icechunk"
+
 # Chunking: ~1 year of dekadal data per chunk
 ZARR_CHUNK_TIME = 36
 
@@ -101,12 +104,23 @@ NC_FILES = [
 
 
 def get_storage(args):
-    """Create GCS or local Icechunk storage."""
+    """Create GCS, local, or source.coop S3 Icechunk storage."""
     import icechunk
 
     if args.local:
         logger.info(f"  Storage: local ({args.local})")
         return icechunk.local_filesystem_storage(path=args.local)
+
+    if args.source_coop:
+        logger.info(f"  Storage: s3://{SOURCE_COOP_BUCKET}/{SOURCE_COOP_PREFIX}")
+        return icechunk.s3_storage(
+            bucket=SOURCE_COOP_BUCKET,
+            prefix=SOURCE_COOP_PREFIX,
+            region="us-west-2",
+            access_key_id=os.getenv("SOURCE_COOP_ACCESS_KEY_ID"),
+            secret_access_key=os.getenv("SOURCE_COOP_SECRET_ACCESS_KEY"),
+            session_token=os.getenv("SOURCE_COOP_SESSION_TOKEN"),
+        )
 
     bucket = args.gcs_bucket
     prefix = args.gcs_prefix
@@ -403,6 +417,8 @@ def add_storage_args(parser):
     parser.add_argument("--gcs-prefix", type=str, default=GCS_PREFIX)
     parser.add_argument("--local", type=str, default=None,
                         help="Use local storage instead of GCS")
+    parser.add_argument("--source-coop", action="store_true",
+                        help="Write to source.coop S3 instead of GCS")
 
 
 def main():

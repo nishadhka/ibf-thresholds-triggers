@@ -257,3 +257,76 @@ print(ds)
 
 Replace prefix with `gdo_fpar_ic_store`, `gdo_sma_ic_store`, or
 `rfe2_ic_store` for the other datasets.
+
+---
+
+## source.coop (public S3 access)
+
+All four stores are published to [source.coop](https://source.coop) under
+`s3://us-west-2.opendata.source.coop/e4drr-project/observations/`.
+
+| Store | S3 Prefix |
+|-------|-----------|
+| CHIRPS SPI | `e4drr-project/observations/chirps_spi_icechunk` |
+| fAPAR Anomaly | `e4drr-project/observations/gdo_fpar_icechunk` |
+| Soil Moisture Anomaly | `e4drr-project/observations/gdo_sma_icechunk` |
+| RFE2 Rainfall | `e4drr-project/observations/rfe2_icechunk` |
+| IMERG HH Precip | `e4drr-project/observations/imerg_hh_icechunk` |
+
+### Read access (no credentials needed)
+
+```python
+import icechunk
+import xarray as xr
+
+storage = icechunk.s3_storage(
+    bucket="us-west-2.opendata.source.coop",
+    prefix="e4drr-project/observations/chirps_spi_icechunk",
+    region="us-west-2",
+    anonymous=True,
+)
+repo = icechunk.Repository.open(
+    storage, config=icechunk.RepositoryConfig.default()
+)
+session = repo.readonly_session("main")
+ds = xr.open_zarr(session.store, consolidated=False)
+print(ds)
+```
+
+### Transfer from GCS to source.coop
+
+Use `gcs_to_source_coop_transfer.py` to sync stores from GCS to S3:
+
+```bash
+# Set credentials in .env or environment
+export SOURCE_COOP_ACCESS_KEY_ID=...
+export SOURCE_COOP_SECRET_ACCESS_KEY=...
+export SOURCE_COOP_SESSION_TOKEN=...   # optional, for temporary credentials
+
+# Dry run — list files and target paths
+uv run gcs_to_source_coop_transfer.py rfe2 --dry-run
+
+# Transfer a single dataset
+uv run gcs_to_source_coop_transfer.py rfe2
+
+# Transfer all 4 datasets
+uv run gcs_to_source_coop_transfer.py all
+
+# Resume upload only (skip GCS download)
+uv run gcs_to_source_coop_transfer.py rfe2 --skip-download
+
+# Verify uploaded store
+uv run gcs_to_source_coop_transfer.py rfe2 --verify
+```
+
+### Incremental ingestion to source.coop
+
+All four pipeline scripts support `--source-coop` to write directly to
+source.coop instead of GCS:
+
+```bash
+uv run --python 3.12 rfe2_icechunk.py ingest --source-coop
+```
+
+Requires `SOURCE_COOP_ACCESS_KEY_ID`, `SOURCE_COOP_SECRET_ACCESS_KEY`,
+and optionally `SOURCE_COOP_SESSION_TOKEN` in `.env` or environment.
