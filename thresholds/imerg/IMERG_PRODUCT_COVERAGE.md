@@ -189,9 +189,7 @@ from the `init` step.
 **Use `check_product_coverage.py` as the authoritative source** for both
 coverage and product quality.
 
-## Current coverage (2026-03-19)
-
-### Overall
+## Coverage before gap-fill (2026-03-19)
 
 | Product | Days | % |
 |---------|------|---|
@@ -200,7 +198,7 @@ coverage and product quality.
 | Early | 0 | 0.0% |
 | Empty | 198 | 2.1% |
 
-### Gaps
+### Gaps identified
 
 | Period | Days | Status | Cause |
 |--------|------|--------|-------|
@@ -210,66 +208,139 @@ coverage and product quality.
 | 2025-12-02 → 2026-03-05 | 95 | Late | Final not yet released (~3.5 month lag); filled with Late product |
 | 2026-03-06 → 2026-03-10 | 3–5 | Empty | Template extends beyond last ingestion |
 
-### Product transitions
+## Gap-fill executed (2026-03-19)
 
-```
-2000-06-01  →  Final     (backfill start)
-2006-04-01  →  Empty     (THREDDS failure)
-2006-05-01  →  Final     (backfill resumed)
-2007-12-22  →  Empty     (THREDDS failure)
-2008-01-21  →  Final     (backfill resumed)
-2025-07-20  →  Empty     (Final data ends here)
-2025-12-02  →  Late      (Late backfill starts)
-2026-03-06  →  Empty     (not yet ingested)
-```
-
-## Remediation commands
-
-### Fill the 2006/2007-08 gaps (Final data available on NASA servers)
+All three gaps were filled by daisy-chaining `fill` commands:
 
 ```bash
-# April 2006
+# Gap 1: April 2006 — Final (30 days)
 uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
     --start-date 2006-04-01 --end-date 2006-04-30 \
-    --product final --no-cluster --commit-batch 30
-
-# Dec 2007 – Jan 2008
+    --product final --no-cluster --commit-batch 30 \
+&& \
+# Gap 2: Dec 2007 – Jan 2008 — Final (30 days)
 uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
     --start-date 2007-12-22 --end-date 2008-01-20 \
-    --product final --no-cluster --commit-batch 30
-```
-
-### Fill Jul–Nov 2025 with Late product
-
-Final data for this period won't be released until ~Oct 2025 + 3.5 months.
-Fill with Late in the meantime:
-
-```bash
+    --product final --no-cluster --commit-batch 30 \
+&& \
+# Gap 3: Jul–Nov 2025 — Late (135 days, Final not yet available)
 uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
     --start-date 2025-07-20 --end-date 2025-12-01 \
     --product late --no-cluster --commit-batch 30
 ```
 
-### Replace Late with Final (when available)
+### Results
 
-Re-run with `--product final` — the quality-aware resume will overwrite
-Late data with Final:
+| Gap | Days | Product | Time | Result |
+|-----|------|---------|------|--------|
+| 2006-04 | 30/30 | Final | 10 min | 0 failed |
+| 2007-12-22 → 2008-01-20 | 30/30 | Final | 6 min | 0 failed |
+| 2025-07-20 → 2025-12-01 | 135/135 | Late | 48 min | 0 failed |
+| **Total** | **195/195** | | **64 min** | **0 failed** |
 
-```bash
-uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
-    --start-date 2025-07-20 --end-date 2026-03-10 \
-    --product final --no-cluster --commit-batch 30
+## Coverage after gap-fill (2026-03-19)
+
+| Product | Days | % |
+|---------|------|---|
+| Final | 9,150 | 97.2% |
+| Late | 230 | 2.4% |
+| Early | 0 | 0.0% |
+| Empty | 3 | 0.0% |
+
+### Product transitions (updated)
+
+```
+2000-06-01  →  Final     (backfill start, continuous)
+2025-07-20  →  Late      (Final not yet released by NASA)
+2026-03-07  →  Empty     (3 days, not yet ingested)
 ```
 
-### Extend and fill to present
+### Remaining work
+
+**3 empty days** at the tail (2026-03-07 → 2026-03-10):
 
 ```bash
-# Extend template to today
-uv run --python 3.12 imerg_hh_gcs_icechunk.py extend \
-    --end-date 2026-03-19
-
-# Fill recent days with Late
+# Extend template and fill to present
+uv run --python 3.12 imerg_hh_gcs_icechunk.py extend --end-date 2026-03-19
 uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
     --start-date 2026-03-06 --end-date 2026-03-19 \
     --product late --no-cluster --commit-batch 7
+```
+
+**Replace Late with Final** (when NASA releases Final data, ~3.5 months
+after observation). Re-run with `--product final` — the quality-aware
+resume will overwrite Late data:
+
+```bash
+uv run --python 3.12 imerg_hh_gcs_icechunk.py fill \
+    --start-date 2025-07-20 --end-date 2026-03-19 \
+    --product final --no-cluster --commit-batch 30
+```
+
+## Upload to source.coop
+
+The IMERG store is ~12 GB / 12,000+ objects. `gcs_to_source_coop_transfer.py`
+handles this by downloading and uploading in ~2 GB batches, cleaning local
+staging after each batch so only ~2 GB of disk is needed at any time.
+
+### How batched transfer works
+
+```
+Batch 1: chunks_part1 (2 GB)          Batch 2: chunks_part2 (2 GB)
+  GCS ──download──► local staging       GCS ──download──► local staging
+  local ──upload──► source.coop S3      local ──upload──► source.coop S3
+  local ──clean──► free disk            local ──clean──► free disk
+  ...repeat for all 10 batches...
+```
+
+- Objects are grouped by top-level subdir (chunks, manifests, snapshots, etc.)
+- Large groups (e.g. `chunks/` at ~12 GB) are split into ~2 GB sub-batches
+- Small groups (manifests, refs, snapshots, transactions) fit in one batch each
+- After each batch uploads, local files are deleted before the next download
+- Peak local disk usage: **~2 GB** instead of 12 GB
+
+### Credentials
+
+source.coop uses S3-compatible access with **temporary credentials** (STS
+session tokens). These typically expire after 1 hour. The script reads from
+`.env` or environment:
+
+```bash
+# In .env or exported
+export AWS_ACCESS_KEY_ID=ASIA...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...
+export AWS_DEFAULT_REGION=us-west-2
+```
+
+Or using `SOURCE_COOP_*` prefixed names (checked first):
+
+```bash
+export SOURCE_COOP_ACCESS_KEY_ID=...
+export SOURCE_COOP_SECRET_ACCESS_KEY=...
+export SOURCE_COOP_SESSION_TOKEN=...
+```
+
+**Credential lifetime**: at ~2 GB per batch and ~12 min upload time per batch,
+the full 12 GB transfer takes ~60–70 min. Ensure credentials are valid for
+at least 1.5 hours. If credentials expire mid-transfer, refresh `.env` and
+re-run — the script skips already-uploaded files (size-match check).
+
+### Commands
+
+```bash
+# Dry run — show batches
+uv run gcs_to_source_coop_transfer.py --dry-run
+
+# Full transfer (download → upload → clean per batch, ~2 GB disk)
+uv run gcs_to_source_coop_transfer.py
+
+# Keep local files after upload (needs 12 GB disk)
+uv run gcs_to_source_coop_transfer.py --no-clean
+
+# Upload existing staging dir only (skip GCS download)
+uv run gcs_to_source_coop_transfer.py --skip-download
+
+# Verify uploaded store from S3 (anonymous read)
+uv run gcs_to_source_coop_transfer.py --verify
 ```

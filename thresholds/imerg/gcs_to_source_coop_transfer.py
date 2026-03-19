@@ -179,10 +179,14 @@ def get_s3_client():
 
 
 def upload_staging(staging_dir):
-    """Upload entire staging directory to source.coop S3."""
+    """Upload staging directory to source.coop S3. Returns (uploaded, skipped)."""
     s3 = get_s3_client()
 
     files = sorted(f for f in staging_dir.rglob("*") if f.is_file())
+    if not files:
+        print("    No files to upload.")
+        return 0, 0
+
     total_size = sum(f.stat().st_size for f in files)
     print(f"  Upload: {len(files)} files, {total_size / (1024**3):.2f} GB")
     print(f"  Target: s3://{S3_BUCKET}/{S3_PREFIX}/")
@@ -227,7 +231,17 @@ def upload_staging(staging_dir):
 
     elapsed = time.time() - start
     print(f"    Upload complete: {uploaded} new, {skipped} skipped ({elapsed:.0f}s)")
-    print(f"    URL: s3://{S3_BUCKET}/{S3_PREFIX}/")
+    return uploaded, skipped
+
+
+def clean_staging(staging_dir):
+    """Remove all files in staging directory to free disk space."""
+    import shutil
+    if staging_dir.exists():
+        n_files = sum(1 for f in staging_dir.rglob("*") if f.is_file())
+        shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        print(f"    Cleaned {n_files} files from {staging_dir}")
 
 
 def verify_store():
@@ -282,6 +296,8 @@ def main():
                         help="Show batches and sizes, don't transfer")
     parser.add_argument("--skip-download", action="store_true",
                         help="Skip GCS download, upload existing staging dir")
+    parser.add_argument("--no-clean", action="store_true",
+                        help="Keep local staging files after upload (default: clean after each batch)")
     parser.add_argument("--verify", action="store_true",
                         help="Verify uploaded store from S3")
     args = parser.parse_args()
@@ -328,8 +344,10 @@ def main():
         print("\n  (dry run — no transfer)")
         return
 
-    # Download and upload in batches
+    # Download, upload, and clean per batch (~2 GB local disk at a time)
     staging_dir.mkdir(parents=True, exist_ok=True)
+    total_uploaded = 0
+    total_skipped = 0
 
     for i, batch in enumerate(batches):
         sz = f"{batch['size']/(1024**3):.2f} GB" if batch["size"] > 1e9 else f"{batch['size']/(1024**2):.1f} MB"
@@ -340,13 +358,19 @@ def main():
         print(f"\n  Step 1: Download GCS → {staging_dir}")
         download_batch(batch, staging_dir, sa_path)
 
-    # Upload all at once after downloading
-    print(f"\n{'='*60}")
-    print("Upload all to source.coop")
-    print(f"{'='*60}")
-    upload_staging(staging_dir)
+        print(f"\n  Step 2: Upload → source.coop")
+        uploaded, skipped = upload_staging(staging_dir)
+        total_uploaded += uploaded
+        total_skipped += skipped
 
-    print("\nDone.")
+        if not args.no_clean:
+            print(f"\n  Step 3: Clean staging")
+            clean_staging(staging_dir)
+
+    print(f"\n{'='*60}")
+    print(f"Transfer complete: {total_uploaded} uploaded, {total_skipped} skipped")
+    print(f"URL: s3://{S3_BUCKET}/{S3_PREFIX}/")
+    print("Done.")
 
 
 if __name__ == "__main__":
