@@ -37,6 +37,9 @@ GCS_BUCKET = "cpc_awc"
 GCS_PREFIX = "ea_imerg_ic_store"
 SERVICE_ACCOUNT_FILE = "coiled-data-e4drr_202505.json"
 
+SOURCE_COOP_BUCKET = "us-west-2.opendata.source.coop"
+SOURCE_COOP_PREFIX = "e4drr-project/observations/imerg_hh_icechunk"
+
 IMERG_PRODUCTS = {
     "GPM_3IMERGHH":  {"name": "Final", "quality": 3},
     "GPM_3IMERGHHL": {"name": "Late",  "quality": 2},
@@ -87,6 +90,8 @@ def main():
     )
     parser.add_argument("--gcs-prefix", type=str, default=None)
     parser.add_argument("--sa-file", type=str, default=SERVICE_ACCOUNT_FILE)
+    parser.add_argument("--source-coop", action="store_true",
+                        help="Read from source.coop S3 (anonymous, no SA file needed)")
     parser.add_argument("--csv", type=str, default=None,
                         help="Write per-day product coverage to CSV file")
     args = parser.parse_args()
@@ -94,16 +99,25 @@ def main():
     import icechunk
     import xarray as xr
 
-    gcs_prefix = args.gcs_prefix or GCS_PREFIX
-    sa_path = Path(__file__).parent / args.sa_file
-    if not sa_path.exists():
-        sa_path = Path(__file__).parent / ".." / "hf-gdo" / args.sa_file
+    if args.source_coop:
+        print(f"Reading from s3://{SOURCE_COOP_BUCKET}/{SOURCE_COOP_PREFIX}/")
+        storage = icechunk.s3_storage(
+            bucket=SOURCE_COOP_BUCKET,
+            prefix=SOURCE_COOP_PREFIX,
+            region="us-west-2",
+            anonymous=True,
+        )
+    else:
+        gcs_prefix = args.gcs_prefix or GCS_PREFIX
+        sa_path = Path(__file__).parent / args.sa_file
+        if not sa_path.exists():
+            sa_path = Path(__file__).parent / ".." / "hf-gdo" / args.sa_file
+        storage = icechunk.gcs_storage(
+            bucket=GCS_BUCKET,
+            prefix=gcs_prefix,
+            service_account_file=str(sa_path),
+        )
 
-    storage = icechunk.gcs_storage(
-        bucket=GCS_BUCKET,
-        prefix=gcs_prefix,
-        service_account_file=str(sa_path),
-    )
     repo = icechunk.Repository.open(
         storage, config=icechunk.RepositoryConfig.default()
     )
@@ -115,7 +129,10 @@ def main():
     n_days = len(times) // 48
     ds.close()
 
-    print(f"Store: gs://{GCS_BUCKET}/{gcs_prefix}")
+    if args.source_coop:
+        print(f"Store: s3://{SOURCE_COOP_BUCKET}/{SOURCE_COOP_PREFIX}")
+    else:
+        print(f"Store: gs://{GCS_BUCKET}/{gcs_prefix}")
     print(f"Days:  {n_days}  (time steps: {len(times)})")
     print(f"Range: {times[0].date()} → {times[-1].date()}")
 
