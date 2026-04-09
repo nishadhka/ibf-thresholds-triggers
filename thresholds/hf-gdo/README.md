@@ -273,6 +273,35 @@ All four stores are published to [source.coop](https://source.coop) under
 | RFE2 Rainfall | `e4drr-project/observations/rfe2_icechunk` |
 | IMERG HH Precip | `e4drr-project/observations/imerg_hh_icechunk` |
 
+### Pencil-chunked stores (time-series optimized)
+
+Pencil-chunked versions of the pancake stores, optimized for fast
+time-series queries at a single location:
+
+| Store | S3 Prefix | Chunks |
+|-------|-----------|--------|
+| CHIRPS SPI (pencil) | `e4drr-project/observations/chirps_spi_pencil_zarr` | (all, 5, 5) |
+| fAPAR Anomaly (pencil) | `e4drr-project/observations/gdo_fpar_pencil_zarr` | (all, 5, 5) |
+| Soil Moisture Anomaly (pencil) | `e4drr-project/observations/gdo_sma_pencil_zarr` | (all, 5, 5) |
+| RFE2 Rainfall (pencil) | `e4drr-project/observations/rfe2_pencil_zarr` | (all, 5, 5) |
+| IMERG HH Precip (pencil) | `e4drr-project/observations/imerg_hh_pencil_zarr` | (all, 5, 5) |
+
+Create pencil stores on source.coop using `rechunk_to_pencil.py --coiled`:
+
+```bash
+# Dry run — show source/target shapes
+uv run rechunk_to_pencil.py all --coiled --dry-run
+
+# Rechunk a single dataset
+uv run rechunk_to_pencil.py gdo_fpar --coiled
+
+# Rechunk all datasets
+uv run rechunk_to_pencil.py all --coiled
+
+# Verify pencil store (anonymous read)
+uv run rechunk_to_pencil.py gdo_fpar --coiled --verify
+```
+
 ### Read access (no credentials needed)
 
 ```python
