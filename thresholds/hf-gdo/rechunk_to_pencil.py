@@ -105,6 +105,13 @@ DATASETS = {
         "s3_pencil_prefix": "rfe2_pencil_icechunk",
         "s3_pencil_zarr_prefix": "rfe2_pencil_zarr",
     },
+    "chirps_daily": {
+        "gcs_prefix": "chirps_daily_ic_store",
+        "pencil_prefix": "chirps_daily_pencil_ic_store",
+        "s3_source_prefix": "chirps_daily_icechunk",
+        "s3_pencil_prefix": "chirps_daily_pencil_icechunk",
+        "s3_pencil_zarr_prefix": "chirps_daily_pencil_zarr",
+    },
     "imerg_hh": {
         "gcs_prefix": "ea_imerg_ic_store",
         "pencil_prefix": "ea_imerg_pencil_ic_store",

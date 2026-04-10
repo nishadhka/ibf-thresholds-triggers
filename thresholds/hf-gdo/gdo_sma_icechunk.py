@@ -121,7 +121,7 @@ ZIP_FILES = [
     "smang_m_gdo_20230101_20231221_t.zip",
     "smang_m_gdo_20240101_20241221_t.zip",
     "smang_m_gdo_20250101_20251221_t.zip",
-    "smang_m_gdo_20260101_20260221_t.zip",
+    "smang_m_gdo_20260101_20260321_t.zip",
 ]
 
 
