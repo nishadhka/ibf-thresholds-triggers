@@ -305,7 +305,7 @@ def cmd_ingest(args):
             n_workers=args.n_workers,
             worker_vm_types="n2-standard-2",
             region="us-west1",
-            workspace="gcp-sewaa-nka",
+            workspace=os.getenv("COILED_WORKSPACE"),
             idle_timeout="20 minutes",
         )
         client = distributed.Client(cluster)

@@ -458,7 +458,7 @@ def rechunk_coiled(name, info, chunk_lat, chunk_lon, n_workers, dry_run=False):
         n_workers=n_workers,
         worker_vm_types="n2-highmem-4",
         region="us-west1",
-        workspace="gcp-sewaa-nka",
+        workspace=os.getenv("COILED_WORKSPACE"),
         idle_timeout="30 minutes",
     )
     client = distributed.Client(cluster)
