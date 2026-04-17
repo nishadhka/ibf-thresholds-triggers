@@ -3,7 +3,9 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "earthaccess>=0.12.0",
-#     "netCDF4>=1.6.2",
+#     "h5netcdf>=1.3.0",
+#     "h5py>=3.10.0",
+#     "cftime>=1.6.0",
 #     "xarray>=2024.1.0",
 #     "numpy>=1.26.0",
 #     "pandas>=2.1.0",
@@ -14,37 +16,35 @@
 # ]
 # ///
 """
-IMERG Half-Hourly Final East Africa — THREDDS to GCS Icechunk via Coiled
-=========================================================================
+IMERG Half-Hourly East Africa — NASA Earthdata S3 → GCS Icechunk via Coiled
+============================================================================
 
-Reads GPM IMERG Final Half-Hourly (GPM_3IMERGHH v07) precipitation data from
-GES DISC THREDDS ncml daily aggregations, subsets to East Africa via server-side
-OPeNDAP subsetting, writes directly to a GCS-backed Icechunk store.
+Reads GPM IMERG Half-Hourly v07 precipitation (Final / Late / Early) as
+native HDF5 granules from NASA Earthdata Cloud via the `earthaccess`
+client, subsets to East Africa, and writes to a GCS-backed Icechunk store.
 
-Data access method: THREDDS OPeNDAP with ncml daily aggregation
-  - Each ncml file aggregates 48 half-hourly granules into one day
-  - Server-side subsetting: only EA bbox data is transferred
-  - ~365 OPeNDAP requests per year (vs ~17,500 granule downloads)
-  - No S3 credentials needed, no HTTPS rate limiting
+Data access
+  - 48 HDF5 granules per day, ~10 MB each
+  - `earthaccess.search_data` finds granule URLs; `earthaccess.open`
+    returns fsspec file objects that stream bytes directly
+  - From us-west-2 AWS: direct S3 reads (s3://gesdisc-cumulus-prod-protected/)
+  - From other regions (e.g. Coiled GCP workers): HTTPS from
+    data.gesdisc.earthdata.nasa.gov — bearer-token auth handled by earthaccess
 
-Why not HTTPS granule download?
-  - 20 concurrent workers downloading ~10 MB files from GES DISC triggers
-    rate limiting: HTML error pages, truncated files, worker segfaults
-  - S3 direct access (s3://gesdisc-cumulus-prod-protected/) requires AWS
-    us-west-2 — blocked from GCP by IAM policy (s3-same-region-access-role)
-
-Why not single-granule OPeNDAP?
-  - Individual OPeNDAP requests to GES DISC hit concurrent connection limits
-  - THREDDS ncml aggregation bundles 48 granules per request, reducing load
+Why earthaccess rather than THREDDS?
+  NASA GES DISC's THREDDS aggregation endpoint is being phased out and has
+  been repeatedly unstable (5xx responses, server-side DNS failures).  Direct
+  HDF5 access via earthaccess is the supported path going forward.
 
 GCS bucket: cpc_awc
 Store prefix: ea_imerg_ic_store (production), test_ea_imerg_ic_store (test)
-THREDDS base: https://gpm1.gesdisc.eosdis.nasa.gov/thredds/dodsC/aggregation/
+Granule host: data.gesdisc.earthdata.nasa.gov (HTTPS) or
+              s3://gesdisc-cumulus-prod-protected/ (from us-west-2)
 
 Subcommands:
 
   init     — Create empty template Icechunk store on GCS
-  fill     — Populate with data using Coiled workers reading THREDDS
+  fill     — Populate with data using Coiled workers reading S3 granules
   verify   — Inspect store contents
 
 Usage:
@@ -110,9 +110,6 @@ EA_LON_MIN = 19.5
 EA_LON_MAX = 54.0
 EA_BBOX = (EA_LON_MIN, EA_LAT_MIN, EA_LON_MAX, EA_LAT_MAX)
 
-# THREDDS ncml aggregation base URL
-THREDDS_BASE = "https://gpm1.gesdisc.eosdis.nasa.gov/thredds/dodsC/aggregation"
-
 # GCS Icechunk store
 GCS_BUCKET = "cpc_awc"
 GCS_PREFIX = "ea_imerg_ic_store"
@@ -120,7 +117,10 @@ SERVICE_ACCOUNT_FILE = "coiled-data-e4drr_202505.json"
 
 # Chunk sizes: 48 timesteps (1 day) x full lat x full lon
 ZARR_CHUNK_TIME = 48
-FILL_VALUE = np.float32(-9999.9)
+# Use NaN as fill value so consumers can distinguish "never written" from
+# "real zero rainfall".  Earlier code used -9999.9 but extend_store wrote
+# materialised zeros over the unfilled region, defeating that signal.
+FILL_VALUE = np.float32(np.nan)
 
 # Coiled
 COILED_WORKSPACE = "e4drr"
@@ -131,38 +131,16 @@ COILED_REGION = "us-east1"
 
 
 def authenticate_earthdata():
-    """Authenticate with NASA Earthdata and set up OPeNDAP prerequisite files.
+    """Authenticate with NASA Earthdata Cloud via earthaccess.
 
-    THREDDS OPeNDAP requires .netrc and .dodsrc files.
+    Reads EARTHDATA_USERNAME / EARTHDATA_PASSWORD from the environment and
+    caches a bearer token in ~/.netrc for subsequent fsspec/HTTP clients.
+    No .dodsrc/OPeNDAP rigging required — we stream HDF5 granules directly.
     """
     import earthaccess
 
     auth = earthaccess.login(strategy="environment")
     logger.info("Earthdata authentication successful")
-
-    netrc_path = Path.home() / ".netrc"
-    if not netrc_path.exists():
-        username = os.getenv("EARTHDATA_USERNAME")
-        password = os.getenv("EARTHDATA_PASSWORD")
-        netrc_path.write_text(
-            f"machine urs.earthdata.nasa.gov login {username} password {password}\n"
-        )
-        netrc_path.chmod(0o600)
-
-    # .dodsrc required by netcdf-c for OPeNDAP auth (absolute paths only)
-    home = str(Path.home())
-    dodsrc_content = (
-        f"HTTP.COOKIEJAR={home}/.urs_cookies\n"
-        f"HTTP.NETRC={home}/.netrc\n"
-    )
-    for dodsrc_path in [Path.home() / ".dodsrc", Path.cwd() / ".dodsrc"]:
-        dodsrc_path.write_text(dodsrc_content)
-
-    cookie_jar = Path.home() / ".urs_cookies"
-    if not cookie_jar.exists():
-        cookie_jar.touch()
-    cookie_jar.chmod(0o600)
-
     return auth
 
 
@@ -195,54 +173,50 @@ def get_gcs_storage(gcs_prefix):
     return storage
 
 
-def build_thredds_day_urls(start_date: str, end_date: str, product: str = DEFAULT_PRODUCT):
-    """Build THREDDS ncml OPeNDAP URLs for each day in the date range.
+def build_day_list(start_date: str, end_date: str, product: str = DEFAULT_PRODUCT):
+    """Enumerate (day, short_name) tuples for each day in the date range.
 
-    Each ncml file aggregates 48 half-hourly granules for one day.
-    URL pattern: .../aggregation/{collection}/{year}/
-                 {collection}_Aggregation_{year}{doy}.ncml.ncml
-
-    The collection name varies by product (Final/Late/Early).
-    Returns list of (date, url) tuples.
+    Granule URLs are discovered per-day via earthaccess.search_data at fill
+    time — no URL construction here, since NASA switched away from
+    predictable THREDDS ncml paths to Earthdata Cloud's CMR catalogue.
     """
     prod = IMERG_PRODUCTS[product]
-    collection = f"{prod['short_name']}.{prod['version']}"
+    short_name = prod["short_name"]
 
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
     days = pd.date_range(start, end, freq="D")
 
-    day_urls = []
-    for day in days:
-        year = day.year
-        doy = day.day_of_year
-        ncml_name = f"{collection}_Aggregation_{year}{doy:03d}.ncml.ncml"
-        url = f"{THREDDS_BASE}/{collection}/{year}/{ncml_name}"
-        day_urls.append((day, url))
-
-    logger.info(f"Built {len(day_urls)} THREDDS day URLs ({product}): {start_date} to {end_date}")
-    return day_urls
+    day_list = [(day, short_name) for day in days]
+    logger.info(
+        f"Built {len(day_list)} day entries ({product} / {short_name}): "
+        f"{start_date} to {end_date}"
+    )
+    return day_list
 
 
 # --- Worker function (runs on Coiled) ---
 
 
-def worker_read_thredds_day(day_info):
-    """Worker: read one day from THREDDS ncml, subset to EA, return numpy.
+def worker_read_s3_day(day_info):
+    """Worker: stream 48 HDF5 granules from NASA Earthdata for one day,
+    subset to EA, return a numpy array in (time, lat, lon) order.
 
-    Runs on Coiled workers. Opens the daily ncml aggregation via OPeNDAP,
-    server-side subsets to EA bounding box, returns 48 half-hourly timesteps.
-
-    Only the EA subset is transferred over the network (~550 KB per day
-    vs ~480 MB for all 48 global granules).
+    Runs on Coiled workers or locally.  Uses `earthaccess.open` which
+    chooses between direct S3 (in us-west-2) and authenticated HTTPS.
+    Only the EA bbox is materialised in RAM — global rasters are read
+    lazily and subset before `.load()`.
     """
-    from pathlib import Path
+    import os as _os
 
+    import earthaccess
     import numpy as np
+    import pandas as pd
     import xarray as xr
 
     t_start_idx = day_info["t_start_idx"]
-    url = day_info["url"]
+    day_str = day_info["day"]
+    short_name = day_info["short_name"]
     username = day_info["username"]
     password = day_info["password"]
     lat_min = day_info["lat_min"]
@@ -250,54 +224,59 @@ def worker_read_thredds_day(day_info):
     lon_min = day_info["lon_min"]
     lon_max = day_info["lon_max"]
 
-    # Set up .netrc and .dodsrc on worker for OPeNDAP auth
-    home = str(Path.home())
-    netrc_path = Path.home() / ".netrc"
-    if not netrc_path.exists():
-        netrc_path.write_text(
-            f"machine urs.earthdata.nasa.gov login {username} password {password}\n"
-        )
-        netrc_path.chmod(0o600)
+    # Ensure worker env carries the creds so earthaccess can log in
+    _os.environ.setdefault("EARTHDATA_USERNAME", username)
+    _os.environ.setdefault("EARTHDATA_PASSWORD", password)
+    earthaccess.login(strategy="environment")
 
-    dodsrc_content = (
-        f"HTTP.COOKIEJAR={home}/.urs_cookies\n"
-        f"HTTP.NETRC={home}/.netrc\n"
-    )
-    for dp in [Path.home() / ".dodsrc", Path.cwd() / ".dodsrc"]:
-        if not dp.exists():
-            dp.write_text(dodsrc_content)
+    day = pd.Timestamp(day_str)
+    day_end = day + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 
-    cookie_jar = Path.home() / ".urs_cookies"
-    if not cookie_jar.exists():
-        cookie_jar.touch()
-        cookie_jar.chmod(0o600)
-
-    # Open THREDDS ncml via OPeNDAP — server-side subset (with retry)
     import random
     import time as _time
 
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            ds = xr.open_dataset(url, engine="netcdf4", decode_timedelta=False)
+            results = earthaccess.search_data(
+                short_name=short_name,
+                version="07",
+                temporal=(
+                    day.strftime("%Y-%m-%dT%H:%M:%S"),
+                    day_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                ),
+            )
+            if len(results) != 48:
+                raise RuntimeError(
+                    f"Expected 48 granules for {day.date()} / {short_name}, "
+                    f"got {len(results)}"
+                )
+            files = earthaccess.open(results)
+            ds = xr.open_mfdataset(
+                files,
+                engine="h5netcdf",
+                group="Grid",
+                combine="nested",
+                concat_dim="time",
+                decode_times=False,  # skip cftime decoding; we don't need
+                                     # the times — indices are predetermined
+            )
             subset = ds["precipitation"].sel(
                 lat=slice(lat_min, lat_max),
                 lon=slice(lon_min, lon_max),
             ).load()
             ds.close()
             break
-        except Exception as e:
+        except Exception:
             if attempt < max_retries - 1:
-                wait = (2 ** attempt) + random.uniform(0, 2)
-                _time.sleep(wait)
+                _time.sleep((2 ** attempt) + random.uniform(0, 2))
             else:
                 raise
 
-    # IMERG native order in THREDDS is (time, lon, lat) — transpose to (time, lat, lon)
+    # HDF5 native order is (time, lon, lat) — transpose to (time, lat, lon)
     subset = subset.transpose("time", "lat", "lon")
     data = subset.values.astype(np.float32)
     n_t = data.shape[0]
-
     return {
         "t_start_idx": t_start_idx,
         "n_t": n_t,
@@ -311,29 +290,48 @@ def worker_read_thredds_day(day_info):
 def init_store(args):
     """Create empty template Icechunk store on GCS.
 
-    Probes one THREDDS day to get the EA lat/lon grid, then creates an empty
-    template with the full time range.
+    Probes one HDF5 granule via earthaccess to get the EA lat/lon grid,
+    then creates an empty template with the full time range.
     """
     import dask.array as da
+    import earthaccess
     import icechunk
     import xarray as xr
 
     logger.info("=" * 60)
-    logger.info("INIT: Creating IMERG HH EA template on GCS via THREDDS probe")
+    logger.info("INIT: Creating IMERG HH EA template on GCS via earthaccess probe")
     logger.info("=" * 60)
     start = time.time()
 
     authenticate_earthdata()
 
-    day_urls = build_thredds_day_urls(args.start_date, args.end_date, product=DEFAULT_PRODUCT)
-    if not day_urls:
+    day_list = build_day_list(args.start_date, args.end_date, product=DEFAULT_PRODUCT)
+    if not day_list:
         logger.error("No days in range!")
         return
 
-    # Probe first day via THREDDS to get EA grid
-    probe_date, probe_url = day_urls[0]
-    logger.info(f"  Probing THREDDS: {probe_url}")
-    ds_probe = xr.open_dataset(probe_url, engine="netcdf4", decode_timedelta=False)
+    # Probe first day via earthaccess to get the native grid
+    probe_date, probe_short = day_list[0]
+    logger.info(
+        f"  Probing {probe_short} granules for {probe_date.date()} ..."
+    )
+    probe_end = probe_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    probe_results = earthaccess.search_data(
+        short_name=probe_short, version="07",
+        temporal=(
+            probe_date.strftime("%Y-%m-%dT%H:%M:%S"),
+            probe_end.strftime("%Y-%m-%dT%H:%M:%S"),
+        ),
+    )
+    if len(probe_results) != 48:
+        raise RuntimeError(
+            f"Probe expected 48 granules for {probe_date.date()}, "
+            f"got {len(probe_results)}"
+        )
+    probe_files = earthaccess.open([probe_results[0]])
+    ds_probe = xr.open_dataset(
+        probe_files[0], engine="h5netcdf", group="Grid", decode_times=False,
+    )
 
     lat_all = ds_probe.lat.values
     lon_all = ds_probe.lon.values
@@ -342,13 +340,12 @@ def init_store(args):
     lon_mask = (lon_all >= EA_LON_MIN) & (lon_all <= EA_LON_MAX)
     lat_ea = lat_all[lat_mask]
     lon_ea = lon_all[lon_mask]
-
-    n_hh_per_day = ds_probe.sizes["time"]  # should be 48
     ds_probe.close()
 
+    n_hh_per_day = 48  # IMERG HH is always 48 half-hours per day
     n_lat = len(lat_ea)
     n_lon = len(lon_ea)
-    n_days = len(day_urls)
+    n_days = len(day_list)
     n_time = n_days * n_hh_per_day
 
     logger.info(f"  EA lat: {n_lat} pts [{lat_ea[0]:.2f} .. {lat_ea[-1]:.2f}]")
@@ -380,7 +377,7 @@ def init_store(args):
                     "long_name": "Half-hourly precipitation rate",
                     "units": "mm/hr",
                     "source": "IMERG v07 (Final/Late/Early)",
-                    "access_method": "THREDDS ncml OPeNDAP aggregation",
+                    "access_method": "NASA Earthdata Cloud (HDF5 granules via earthaccess)",
                 },
             ),
         },
@@ -395,7 +392,7 @@ def init_store(args):
             "region": "East Africa",
             "bbox": f"[{EA_LON_MIN}, {EA_LAT_MIN}, {EA_LON_MAX}, {EA_LAT_MAX}]",
             "temporal_resolution": "30 minutes",
-            "thredds_base": THREDDS_BASE,
+            "access_method": "earthaccess (HDF5 via CMR)",
         },
     )
     logger.info(f"  Template:\n{template}")
@@ -441,11 +438,12 @@ def init_store(args):
 
 
 def fill_store(args):
-    """Fill EA template using Coiled workers reading THREDDS, writing to GCS.
+    """Fill EA template using Coiled workers reading Earthdata S3/HTTPS,
+    writing to GCS.
 
-    Each worker reads one day (48 HH steps) from THREDDS ncml OPeNDAP with
-    server-side subsetting. Coordinator writes to GCS-backed Icechunk and
-    commits in batches.
+    Each worker resolves 48 HH granules for a day via earthaccess,
+    subsets to EA, and returns a numpy array.  Coordinator writes to
+    GCS-backed Icechunk and commits in batches.
     """
     import coiled
     import distributed
@@ -457,14 +455,17 @@ def fill_store(args):
     prod_tag = f"[{prod_info['short_name']}]"
 
     logger.info("=" * 60)
-    logger.info(f"FILL: THREDDS ncml → GCS Icechunk (product: {product} / {prod_info['short_name']})")
+    logger.info(
+        f"FILL: Earthdata S3/HTTPS → GCS Icechunk "
+        f"(product: {product} / {prod_info['short_name']})"
+    )
     logger.info("=" * 60)
     overall_start = time.time()
 
     authenticate_earthdata()
     username, password = get_earthdata_credentials()
 
-    day_urls = build_thredds_day_urls(args.start_date, args.end_date, product=product)
+    day_urls = build_day_list(args.start_date, args.end_date, product=product)
     n_days = len(day_urls)
     if n_days == 0:
         logger.error("No days in range!")
@@ -487,7 +488,7 @@ def fill_store(args):
 
     # Map each day to its starting time index in the template
     day_infos = []
-    for day, url in day_urls:
+    for day, short_name in day_urls:
         # Find the first HH step for this day in the template
         day_start = pd.Timestamp(day).normalize()
         matches = np.where(template_times >= day_start)[0]
@@ -498,7 +499,7 @@ def fill_store(args):
         day_infos.append({
             "t_start_idx": t_start_idx,
             "day": str(day.date()),
-            "url": url,
+            "short_name": short_name,
             "username": username,
             "password": password,
             "lat_min": EA_LAT_MIN,
@@ -542,12 +543,15 @@ def fill_store(args):
     except Exception:
         pass
 
-    # Skip days already filled by same or higher quality
+    # Skip days already filled by same or higher quality.  --force disables
+    # this — useful after a tail-truncate repair, where the historical
+    # batch commits still reference indices whose data was dropped.
+    force = bool(getattr(args, "force", False))
     remaining = []
     for d in day_infos:
         idx = d["t_start_idx"]
         existing_q = filled_quality.get(idx, 0)
-        if existing_q >= current_quality:
+        if not force and existing_q >= current_quality:
             continue  # already filled by same or better product
         remaining.append(d)
 
@@ -567,7 +571,7 @@ def fill_store(args):
     if use_cluster:
         logger.info(f"  Launching Coiled cluster with {n_workers} workers...")
         cluster = coiled.Cluster(
-            name=f"imerg-hh-thredds-{int(time.time()) % 10000}",
+            name=f"imerg-hh-s3-{int(time.time()) % 10000}",
             n_workers=n_workers,
             worker_vm_types="n2-standard-4",
             package_sync=True,
@@ -607,8 +611,8 @@ def fill_store(args):
             futures = {}
             for d_info in batch:
                 future = client.submit(
-                    worker_read_thredds_day, d_info,
-                    key=f"thredds-{d_info['day']}",
+                    worker_read_s3_day, d_info,
+                    key=f"earthaccess-{d_info['day']}",
                 )
                 futures[future] = d_info
 
@@ -642,7 +646,7 @@ def fill_store(args):
         else:
             for d_info in batch:
                 try:
-                    result = worker_read_thredds_day(d_info)
+                    result = worker_read_s3_day(d_info)
                     data = result["data"]
                     t_start = result["t_start_idx"]
                     n_t = result["n_t"]
@@ -732,7 +736,7 @@ def verify_store(args):
         logger.info("\nSpot-check: loading first 48 timesteps (1 day)...")
         try:
             sample = ds[IMERG_VAR].isel(time=slice(0, 48)).load()
-            valid = sample.values[~np.isnan(sample.values) & (sample.values != FILL_VALUE)]
+            valid = sample.values[~np.isnan(sample.values)]
             logger.info(f"  Valid values: {len(valid)}/{sample.values.size}")
             if len(valid) > 0:
                 logger.info(f"  Min: {valid.min():.4f}, Max: {valid.max():.4f}, Mean: {valid.mean():.4f}")
@@ -792,19 +796,36 @@ def extend_store(args):
         logger.info("  Template already covers this date range, nothing to extend.")
         return
 
-    # New time slots: from day after current end to new end
-    next_day = (current_end + pd.Timedelta(minutes=30)).normalize()
-    new_times = pd.date_range(next_day, new_end, freq="30min")
-    n_new = len(new_times)
-    if n_new == 0:
+    # New time slots: start at the next 30-min boundary after current_end.
+    # Build whole days only (48 HH steps each) to keep day boundaries aligned
+    # with chunk boundaries.  Earlier code used
+    #     pd.date_range(next_day, new_end, freq="30min")
+    # which is *inclusive* on both ends — that produced an extra midnight
+    # timestamp at the tail (e.g. ...2026-03-09T00:00).  The next extend's
+    # `(current_end + 30min).normalize()` then rounded back to that same
+    # midnight, creating duplicate timestamps in the time axis.
+    next_slot = current_end + pd.Timedelta(minutes=30)
+    if next_slot.time() != pd.Timestamp("2000-01-01").time():
+        raise RuntimeError(
+            f"Cannot extend: existing time axis ends at {current_end}, "
+            f"which is not a clean half-hour-before-midnight boundary. "
+            f"Repair the time axis first."
+        )
+    last_day = pd.Timestamp(args.end_date).normalize()
+    n_new_days = (last_day - next_slot.normalize()).days + 1
+    if n_new_days <= 0:
         logger.info("  No new time slots needed.")
         return
+    n_new = n_new_days * 48
+    new_times = pd.date_range(next_slot, periods=n_new, freq="30min")
 
-    n_new_days = n_new // 48
     logger.info(f"  Adding {n_new} time slots ({n_new_days} days)")
     logger.info(f"  New range: {new_times[0]} to {new_times[-1]}")
 
-    # Create append dataset with empty data
+    # Create append dataset with empty data — compute=False on to_zarr means
+    # only the array metadata is written; the new chunks remain unwritten and
+    # therefore read back as the array's fill_value (NaN), letting consumers
+    # distinguish "never filled" from "real zero rainfall".
     shape = (n_new, n_lat, n_lon)
     chunk_time = min(ZARR_CHUNK_TIME, n_new)
     chunks = (chunk_time, n_lat, n_lon)
@@ -823,12 +844,14 @@ def extend_store(args):
         },
     )
 
-    # Append to existing store
+    # Append to existing store — compute=False so the data chunks are not
+    # materialised (only the time-coord and array length grow).
     session = repo.writable_session("main")
     append_ds.to_zarr(
         session.store,
         mode="a",
         append_dim="time",
+        compute=False,
         consolidated=False,
     )
     session.commit(f"extend template to {args.end_date} (+{n_new_days} days)")
@@ -844,7 +867,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="IMERG HH Final EA — THREDDS to GCS Icechunk via Coiled",
+        description="IMERG HH EA — Earthdata S3 → GCS Icechunk via Coiled",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -860,7 +883,7 @@ def main():
     p_init.add_argument("--gcs-prefix", **gcs_args["gcs_prefix"])
 
     # -- fill --
-    p_fill = sub.add_parser("fill", help="Fill via THREDDS → Coiled → GCS")
+    p_fill = sub.add_parser("fill", help="Fill via earthaccess → Coiled → GCS")
     p_fill.add_argument("--start-date", type=str, required=True)
     p_fill.add_argument("--end-date", type=str, required=True)
     p_fill.add_argument("--gcs-prefix", **gcs_args["gcs_prefix"])
@@ -872,6 +895,9 @@ def main():
                         help="Days per commit batch (default 10)")
     p_fill.add_argument("--no-cluster", action="store_true",
                         help="Run sequentially without Coiled (for testing)")
+    p_fill.add_argument("--force", action="store_true",
+                        help="Re-fill days even if commit history says they "
+                             "are already covered (use after a tail repair).")
 
     # -- extend --
     p_extend = sub.add_parser("extend",
