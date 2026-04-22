@@ -115,7 +115,7 @@ def discover_files(data_dir: str):
             stem = f.stem  # before .nc
             parts = stem.split("_")
             # The date part is after "ref1991to2020_"
-            date_part = parts[5].split(".")[0]  # "194003" from "194003.area-subset..."
+            date_part = parts[6].split(".")[0]  # "194003" from "194003.area-subset..."
             year = int(date_part[:4])
             month = int(date_part[4:6])
             dt = pd.Timestamp(year=year, month=month, day=1)
@@ -153,7 +153,7 @@ def init_store(args):
     logger.info("=" * 60)
     start = time.time()
 
-    # Discover files
+    # Discover files for spatial coords (need at least one file in data_dir)
     logger.info(f"Scanning data directory: {args.data_dir}")
     catalog = discover_files(args.data_dir)
 
@@ -170,20 +170,26 @@ def init_store(args):
     logger.info(f"  Lat: {n_lat} points [{lat[0]:.2f} .. {lat[-1]:.2f}]")
     logger.info(f"  Lon: {n_lon} points [{lon[0]:.2f} .. {lon[-1]:.2f}]")
 
-    # Build unified time coordinate from the longest series (SPI1)
-    # All SPI periods share the same grid; shorter ones just start later
-    all_times = set()
-    for spi, entries in catalog.items():
-        for dt, _ in entries:
-            all_times.add(dt)
-    time_coords = np.array(sorted(all_times), dtype="datetime64[ns]")
+    # Build time coordinate — either from explicit range or from discovered files
+    if args.time_start and args.time_end:
+        time_coords = pd.date_range(args.time_start, args.time_end, freq="MS").values.astype("datetime64[ns]")
+        logger.info(f"  Time (override): {len(time_coords)} months [{time_coords[0]} .. {time_coords[-1]}]")
+    else:
+        all_times = set()
+        for spi, entries in catalog.items():
+            for dt, _ in entries:
+                all_times.add(dt)
+        time_coords = np.array(sorted(all_times), dtype="datetime64[ns]")
+        logger.info(f"  Time (discovered): {len(time_coords)} months [{time_coords[0]} .. {time_coords[-1]}]")
     n_time = len(time_coords)
-    logger.info(f"  Time: {n_time} months [{time_coords[0]} .. {time_coords[-1]}]")
+
+    # SPI periods — either explicit override or those found in data_dir
+    spi_list = [s.strip() for s in args.spi_periods.split(",")] if args.spi_periods else list(catalog.keys())
 
     # Create template dataset with all SPI variables
     data_vars = {}
     for spi in SPI_PERIODS:
-        if spi not in catalog:
+        if spi not in spi_list:
             continue
         data_vars[spi] = (
             ("time", "lat", "lon"),
@@ -391,11 +397,6 @@ def rechunk_store(args):
     logger.info("=" * 60)
     overall_start = time.time()
 
-    dask.config.set({
-        "array.rechunk.method": "p2p",
-        "optimization.fuse.active": False,
-    })
-
     # Open source store
     if args.gcs_bucket and not args.source_path.startswith("/"):
         storage = icechunk.gcs_storage(
@@ -403,6 +404,33 @@ def rechunk_store(args):
             prefix=args.source_gcs_prefix,
             service_account_file=args.service_account,
         )
+        repo = icechunk.Repository.open(
+            storage, config=icechunk.RepositoryConfig.default(),
+        )
+        session = repo.readonly_session("main")
+        ds = xr.open_zarr(session.store, consolidated=False)
+    elif args.source_path and args.source_path.startswith("s3://"):
+        import os
+        s3_url = args.source_path[5:]  # strip "s3://"
+        bucket, _, prefix = s3_url.partition("/")
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("SOURCE_COOP_ACCESS_KEY_ID")
+        if access_key:
+            storage = icechunk.s3_storage(
+                bucket=bucket,
+                prefix=prefix,
+                region=os.environ.get("AWS_DEFAULT_REGION", "us-west-2"),
+                access_key_id=access_key,
+                secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("SOURCE_COOP_SECRET_ACCESS_KEY"),
+                session_token=os.environ.get("AWS_SESSION_TOKEN") or os.environ.get("SOURCE_COOP_SESSION_TOKEN"),
+            )
+        else:
+            logger.info("  No S3 credentials found — trying anonymous read")
+            storage = icechunk.s3_storage(
+                bucket=bucket,
+                prefix=prefix,
+                region=os.environ.get("AWS_DEFAULT_REGION", "us-west-2"),
+                anonymous=True,
+            )
         repo = icechunk.Repository.open(
             storage, config=icechunk.RepositoryConfig.default(),
         )
@@ -578,6 +606,12 @@ def main():
     p_init.add_argument("--gcs-bucket", type=str, default=None)
     p_init.add_argument("--gcs-prefix", type=str, default="ecmwf_spi_ea")
     p_init.add_argument("--service-account", type=str, default=SERVICE_ACCOUNT_FILE)
+    p_init.add_argument("--time-start", type=str, default=None,
+                        help="Override time start as YYYY-MM (e.g. 1940-01)")
+    p_init.add_argument("--time-end", type=str, default=None,
+                        help="Override time end as YYYY-MM (e.g. 2026-01)")
+    p_init.add_argument("--spi-periods", type=str, default=None,
+                        help="Comma-separated SPI periods to create (e.g. SPI1,SPI3,SPI6,SPI12,SPI24,SPI36,SPI48)")
 
     # ── fill ──
     p_fill = sub.add_parser("fill", help="Fill store from local NetCDF files")

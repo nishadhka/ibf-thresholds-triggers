@@ -171,23 +171,116 @@ A 10-year return period drought threshold of SPI = -1.28 means:
 - The event shown in the screenshot (2015-09, SPI3 = -3.065 at 9°N, 40°E)
   exceeded the 50-year threshold, indicating an exceptional drought
 
-## Output File Structure
+## source.coop Stores
 
-The return period output is stored both locally and on GCS:
+All three stores are publicly readable (no credentials required) at
+**https://source.coop/e4drr-project/observations**.
 
-- **Local**: `ecmwf_spi_return_periods.nc` (7.6 MB)
-- **GCS**: `gs://cpc_awc/ecmwf_spi/ecmwf_spi_return_periods.nc`
+| Store | source.coop path | Format | Chunk layout |
+|---|---|---|---|
+| Pan Icechunk | `era5_ecmwf_icechunk` | Icechunk (Zarr v3) | 120 months × 161 lat × 133 lon per SPI |
+| Pencil Zarr | `era5_ecmwf_pencil` | Zarr v3 | 1033 months × 5 lat × 5 lon per SPI |
+| RP Icechunk | `era5_ecmwf_rp_icechunk` | Icechunk (Zarr v3) | 1 SPI × 5 RP × 161 lat × 133 lon |
 
-`ecmwf_spi_return_periods.nc` contains:
+### Open the pan Icechunk store (SPI time series, all periods)
+
+```python
+import icechunk
+import xarray as xr
+
+storage = icechunk.s3_storage(
+    bucket="us-west-2.opendata.source.coop",
+    prefix="e4drr-project/observations/era5_ecmwf_icechunk",
+    region="us-west-2",
+    anonymous=True,
+)
+repo = icechunk.Repository.open(storage, config=icechunk.RepositoryConfig.default())
+session = repo.readonly_session("main")
+ds = xr.open_zarr(session.store, consolidated=False)
+# ds has variables SPI1, SPI3, SPI6, SPI12, SPI24, SPI36, SPI48
+# dims: time=1033, lat=161, lon=133
+```
+
+### Open the pencil Zarr store (fast per-pixel time-series access)
+
+```python
+import s3fs
+import xarray as xr
+
+fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": "us-west-2"})
+store = s3fs.S3Map(
+    root="us-west-2.opendata.source.coop/e4drr-project/observations/era5_ecmwf_pencil",
+    s3=fs,
+)
+ds = xr.open_zarr(store, consolidated=True)
+
+# Fast single-pixel time series (pencil chunks = full time loaded in one read)
+spi3_addis = ds["SPI3"].sel(lat=9.0, lon=38.75, method="nearest").load()
+```
+
+### Open the RP Icechunk store (return period thresholds)
+
+```python
+import icechunk
+import xarray as xr
+
+storage = icechunk.s3_storage(
+    bucket="us-west-2.opendata.source.coop",
+    prefix="e4drr-project/observations/era5_ecmwf_rp_icechunk",
+    region="us-west-2",
+    anonymous=True,
+)
+repo = icechunk.Repository.open(storage, config=icechunk.RepositoryConfig.default())
+session = repo.readonly_session("main")
+ds = xr.open_zarr(session.store, consolidated=False)
+
+# Return periods: [3, 5, 10, 20, 50] years
+# SPI periods:   ['SPI1','SPI3','SPI6','SPI12','SPI24','SPI36','SPI48']
+
+# Threshold for a 10-year SPI3 drought at Addis Ababa
+thresh = ds["fitted_threshold"].sel(
+    spi_period="SPI3", return_period=10,
+).sel(lat=9.0, lon=38.75, method="nearest").values
+# → typical value ≈ -1.6 (SPI must drop below this for a 10-yr drought event)
+```
+
+### RP store variables
 
 | Variable | Dimensions | Description |
 |---|---|---|
-| `fitted_threshold` | (spi_period, return_period, lat, lon) | Per-pixel fitted normal thresholds |
-| `empirical_threshold` | (spi_period, return_period, lat, lon) | Per-pixel empirical percentile thresholds |
-| `standard_threshold` | (return_period,) | Standard N(0,1) thresholds |
-| `fit_mu` | (spi_period, lat, lon) | Fitted normal mean |
-| `fit_sigma` | (spi_period, lat, lon) | Fitted normal std dev |
-| `n_valid_months` | (spi_period, lat, lon) | Count of non-NaN months |
+| `fitted_threshold` | (spi_period, return_period, lat, lon) | μ + σ × Φ⁻¹(1/T) per pixel |
+| `empirical_threshold` | (spi_period, return_period, lat, lon) | Empirical percentile per pixel |
+| `standard_threshold` | (return_period,) | Φ⁻¹(1/T) from N(0,1) — same for all pixels |
+| `fit_mu` | (spi_period, lat, lon) | Fitted normal mean per pixel |
+| `fit_sigma` | (spi_period, lat, lon) | Fitted normal std dev per pixel |
+| `n_valid_months` | (spi_period, lat, lon) | Valid month count per pixel |
+
+### Recompute RP store (e.g. after adding a new SPI product)
+
+The RP store is a derived product from the pencil zarr. Rerun `compute-store`
+after updating `era5_ecmwf_pencil`:
+
+```bash
+# Reads pencil zarr from source.coop anonymously,
+# writes RP Icechunk to source.coop (needs write credentials in .env)
+uv run ecmwf_spi_return_periods.py compute-store
+```
+
+### Generate cartopy threshold maps
+
+Produces one PNG per SPI period (7 total), each with 5 subplots (one per
+return period), overlaid with East Africa country boundaries from
+`ea_ghcf_simple.geojson`:
+
+```bash
+uv run ecmwf_spi_return_periods.py plot-map-cartopy \
+    --geojson ea_ghcf_simple.geojson \
+    --output-dir maps/
+# → maps/era5_spi_spi{1,3,6,12,24,36,48}_rp_thresholds_ea.png
+```
+
+Reads the RP Icechunk store from source.coop anonymously — no credentials needed.
+Use `--store-path /local/era5_ecmwf_rp_icechunk` to read from a local store instead.
 
 ## GCS Storage Layout
 

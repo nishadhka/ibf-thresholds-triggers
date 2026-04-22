@@ -8,6 +8,12 @@
 #     "scipy",
 #     "matplotlib",
 #     "pandas",
+#     "icechunk>=0.1",
+#     "zarr>=3",
+#     "s3fs",
+#     "python-dotenv",
+#     "cartopy",
+#     "shapely",
 # ]
 # ///
 """
@@ -61,11 +67,15 @@ Date: 2026-02-17
 """
 
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +91,12 @@ logger = logging.getLogger(__name__)
 
 # SPI accumulation periods
 SPI_PERIODS = ["SPI1", "SPI3", "SPI6", "SPI12", "SPI24", "SPI36", "SPI48"]
+
+# source.coop S3 settings
+S3_BUCKET = "us-west-2.opendata.source.coop"
+S3_REGION = "us-west-2"
+PENCIL_S3_PREFIX = "e4drr-project/observations/era5_ecmwf_pencil"
+RP_ICECHUNK_S3_PREFIX = "e4drr-project/observations/era5_ecmwf_rp_icechunk"
 
 # Drought return periods (years) — left tail of the distribution
 RETURN_PERIODS = [3, 5, 10, 20, 50]
@@ -614,6 +630,385 @@ def run_plot_map(args):
     ds.close()
 
 
+# ─── Cartopy map plots from RP Icechunk store ────────────────────────────────
+
+
+def run_plot_map_cartopy(args):
+    """Plot return period threshold maps with cartopy + GeoJSON country overlay.
+
+    Reads the RP Icechunk store from source.coop (anonymous) and produces one
+    figure per SPI period (7 figures), each with 5 subplots — one per return
+    period.  Country boundaries are drawn from a local GeoJSON file.
+
+    Usage:
+        uv run ecmwf_spi_return_periods.py plot-map-cartopy \\
+            --geojson ea_ghcf_simple.geojson \\
+            --output-dir maps/
+
+        # Use local RP store instead of source.coop
+        uv run ecmwf_spi_return_periods.py plot-map-cartopy \\
+            --store-path /local/era5_ecmwf_rp_icechunk \\
+            --geojson ea_ghcf_simple.geojson
+    """
+    import json
+
+    import cartopy.crs as ccrs
+    import icechunk
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    import xarray as xr
+    from shapely.geometry import shape
+
+    logger.info("Generating cartopy RP threshold maps...")
+
+    # ── Open RP Icechunk store ──
+    store_path = args.store_path
+    if store_path is None:
+        logger.info(f"  Reading s3://{S3_BUCKET}/{RP_ICECHUNK_S3_PREFIX} (anonymous)")
+        storage = icechunk.s3_storage(
+            bucket=S3_BUCKET,
+            prefix=RP_ICECHUNK_S3_PREFIX,
+            region=S3_REGION,
+            anonymous=True,
+        )
+    else:
+        logger.info(f"  Reading local store: {store_path}")
+        storage = icechunk.local_filesystem_storage(path=store_path)
+
+    repo = icechunk.Repository.open(storage, config=icechunk.RepositoryConfig.default())
+    session = repo.readonly_session("main")
+    ds = xr.open_zarr(session.store, consolidated=False)
+
+    lat = ds["lat"].values
+    lon = ds["lon"].values
+    spi_periods = list(ds["spi_period"].values)
+    return_periods = list(ds["return_period"].values)
+
+    # ── Load GeoJSON country boundaries ──
+    with open(args.geojson) as f:
+        gj = json.load(f)
+    country_geoms = [shape(feat["geometry"]) for feat in gj["features"]]
+    country_codes = [feat["properties"].get("GID_0", "") for feat in gj["features"]]
+    logger.info(f"  Countries: {country_codes}")
+
+    proj = ccrs.PlateCarree()
+    extent = [lon.min() - 0.5, lon.max() + 0.5, lat.min() - 0.5, lat.max() + 0.5]
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── One figure per SPI period, 5 subplots (one per RP) ──
+    for s_idx, spi in enumerate(spi_periods):
+        fig, axes = plt.subplots(
+            1, len(return_periods),
+            figsize=(22, 5),
+            subplot_kw={"projection": proj},
+        )
+        fig.suptitle(
+            f"{spi} — Drought Return Period Thresholds (Fitted Normal)\n"
+            f"East Africa | ECMWF ERA5-Drought | ref 1991–2020",
+            fontsize=13, y=1.02,
+        )
+
+        # Shared colormap: all fitted thresholds are ≤ 0
+        # RdYlBu_r: blue=near 0 (milder) → red=very negative (more severe)
+        cmap = "RdYlBu_r"
+        vmin, vmax = -3.0, 0.0
+
+        ims = []
+        for r_idx, (ax, rp) in enumerate(zip(axes, return_periods)):
+            data = ds["fitted_threshold"].isel(
+                spi_period=s_idx, return_period=r_idx,
+            ).values
+
+            im = ax.pcolormesh(
+                lon, lat, data,
+                cmap=cmap, vmin=vmin, vmax=vmax,
+                transform=proj, shading="auto",
+            )
+            ims.append(im)
+
+            # Country boundaries from GeoJSON
+            ax.add_geometries(
+                country_geoms, proj,
+                facecolor="none", edgecolor="black", linewidth=0.6,
+            )
+
+            # Gridlines
+            gl = ax.gridlines(
+                draw_labels=(r_idx == 0),
+                linewidth=0.3, color="gray", alpha=0.5,
+                xlocs=mticker.MultipleLocator(10),
+                ylocs=mticker.MultipleLocator(10),
+            )
+            gl.top_labels = False
+            gl.right_labels = False
+            if r_idx == 0:
+                gl.left_labels = True
+            gl.xlabel_style = {"size": 7}
+            gl.ylabel_style = {"size": 7}
+
+            ax.set_extent(extent, crs=proj)
+            ax.set_title(
+                f"{int(rp)}-yr  ({RP_LABELS[int(rp)]})\n"
+                f"std={float(ds['standard_threshold'].values[r_idx]):.2f}",
+                fontsize=9,
+            )
+
+            # Per-subplot colorbar at bottom
+            cbar = fig.colorbar(
+                im, ax=ax, orientation="horizontal",
+                pad=0.04, shrink=0.9, aspect=20,
+            )
+            cbar.set_label("SPI threshold", fontsize=7)
+            cbar.ax.tick_params(labelsize=6)
+
+        out_path = output_dir / f"era5_spi_{spi.lower()}_rp_thresholds_ea.png"
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"  Saved: {out_path}")
+
+    ds.close()
+    logger.info(f"Done — {len(spi_periods)} figures saved to {output_dir}/")
+
+
+# ─── Compute from pencil zarr store ─────────────────────────────────────────
+
+
+def compute_from_store(args):
+    """Compute return period thresholds by reading from the pencil zarr on source.coop.
+
+    Reads SPI time series from the pencil-chunked zarr (full-time × 5×5 lat/lon),
+    runs per-pixel normal fit + empirical percentiles, and writes the output as a
+    pan-chunk Icechunk store to source.coop S3.
+
+    Pan chunk layout for the RP store: (1, n_rp, n_lat, n_lon) — one SPI-period
+    slab at full spatial extent, matching a flat per-layer access pattern.
+
+    Usage:
+        # Read from source.coop, write RP icechunk to source.coop
+        uv run ecmwf_spi_return_periods.py compute-store
+
+        # Override source/target paths
+        uv run ecmwf_spi_return_periods.py compute-store \\
+            --source-path /local/era5_ecmwf_pencil \\
+            --store-path /local/era5_ecmwf_rp_icechunk
+    """
+    import icechunk
+    import xarray as xr
+    from scipy import stats
+
+    logger.info("=" * 70)
+    logger.info("COMPUTE-STORE: SPI Return Periods from pencil zarr → Icechunk")
+    logger.info("=" * 70)
+    overall_start = time.time()
+
+    # ── Open source pencil zarr ──
+    source_path = args.source_path
+    if source_path is None:
+        # Default: read anonymously from source.coop
+        import s3fs
+        logger.info(f"  Source: s3://{S3_BUCKET}/{PENCIL_S3_PREFIX} (anonymous)")
+        fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
+        store_map = s3fs.S3Map(root=f"{S3_BUCKET}/{PENCIL_S3_PREFIX}", s3=fs)
+        ds = xr.open_zarr(store_map, consolidated=True)
+    else:
+        logger.info(f"  Source: {source_path} (local)")
+        ds = xr.open_zarr(source_path, consolidated=True)
+
+    lat = ds["lat"].values
+    lon = ds["lon"].values
+    n_lat, n_lon = len(lat), len(lon)
+    spi_vars = [v for v in SPI_PERIODS if v in ds.data_vars]
+    n_spi = len(spi_vars)
+    n_rp = len(RETURN_PERIODS)
+    logger.info(f"  Grid: {n_lat} lat × {n_lon} lon")
+    logger.info(f"  SPI variables found: {spi_vars}")
+    logger.info(f"  Return periods: {RETURN_PERIODS}")
+
+    # Standard normal thresholds (pixel-independent)
+    standard_thresholds = np.array(
+        [stats.norm.ppf(1.0 / T) for T in RETURN_PERIODS], dtype=np.float32,
+    )
+    logger.info(f"  Standard thresholds: {dict(zip(RETURN_PERIODS, standard_thresholds.round(3)))}")
+
+    # Output arrays
+    fitted_thresholds   = np.full((n_spi, n_rp, n_lat, n_lon), np.nan, dtype=np.float32)
+    empirical_thresholds= np.full((n_spi, n_rp, n_lat, n_lon), np.nan, dtype=np.float32)
+    fit_mu              = np.full((n_spi, n_lat, n_lon), np.nan, dtype=np.float32)
+    fit_sigma           = np.full((n_spi, n_lat, n_lon), np.nan, dtype=np.float32)
+    n_valid_months      = np.full((n_spi, n_lat, n_lon), 0, dtype=np.int32)
+
+    for s_idx, spi in enumerate(spi_vars):
+        logger.info(f"\n--- Processing {spi} ---")
+        t0 = time.time()
+
+        # Load full time series for this SPI (pencil chunks = fast per-pixel access)
+        data = ds[spi].values.astype(np.float32)  # (n_time, n_lat, n_lon)
+        logger.info(f"  Loaded: shape {data.shape}")
+
+        for i in range(n_lat):
+            for j in range(n_lon):
+                ts = data[:, i, j]
+                valid = ts[~np.isnan(ts)]
+                n_valid = len(valid)
+                n_valid_months[s_idx, i, j] = n_valid
+
+                if n_valid < 30:
+                    continue
+
+                mu = float(np.mean(valid))
+                sigma = float(np.std(valid, ddof=1))
+                fit_mu[s_idx, i, j] = mu
+                fit_sigma[s_idx, i, j] = sigma
+
+                if sigma < 1e-6:
+                    continue
+
+                for r_idx, T in enumerate(RETURN_PERIODS):
+                    z = stats.norm.ppf(1.0 / T)
+                    fitted_thresholds[s_idx, r_idx, i, j] = mu + sigma * z
+                    empirical_thresholds[s_idx, r_idx, i, j] = np.percentile(valid, 100.0 / T)
+
+        elapsed = time.time() - t0
+        ocean_frac = (n_valid_months[s_idx] < 30).mean()
+        logger.info(f"  Done in {elapsed:.1f}s — ocean/missing: {ocean_frac*100:.1f}%")
+        del data
+
+    ds.close()
+
+    # ── Build output xarray Dataset ──
+    logger.info("\nBuilding output Dataset...")
+    ds_out = xr.Dataset(
+        {
+            "fitted_threshold": (
+                ["spi_period", "return_period", "lat", "lon"],
+                fitted_thresholds,
+                {
+                    "long_name": "SPI drought threshold (fitted normal)",
+                    "units": "dimensionless",
+                    "description": "mu + sigma * ppf(1/T) from fitted N(mu, sigma) per pixel",
+                },
+            ),
+            "empirical_threshold": (
+                ["spi_period", "return_period", "lat", "lon"],
+                empirical_thresholds,
+                {
+                    "long_name": "SPI drought threshold (empirical percentile)",
+                    "units": "dimensionless",
+                    "description": "SPI value at (1/T)×100 percentile of observed series",
+                },
+            ),
+            "standard_threshold": (
+                ["return_period"],
+                standard_thresholds,
+                {
+                    "long_name": "SPI drought threshold (standard normal)",
+                    "units": "dimensionless",
+                    "description": "ppf(1/T) from N(0,1) — same for all pixels by SPI definition",
+                },
+            ),
+            "fit_mu": (
+                ["spi_period", "lat", "lon"],
+                fit_mu,
+                {"long_name": "Fitted normal mean (mu)", "units": "dimensionless"},
+            ),
+            "fit_sigma": (
+                ["spi_period", "lat", "lon"],
+                fit_sigma,
+                {"long_name": "Fitted normal std dev (sigma)", "units": "dimensionless"},
+            ),
+            "n_valid_months": (
+                ["spi_period", "lat", "lon"],
+                n_valid_months,
+                {"long_name": "Number of valid (non-NaN) monthly values"},
+            ),
+        },
+        coords={
+            "spi_period": ("spi_period", spi_vars, {"long_name": "SPI accumulation period"}),
+            "return_period": ("return_period", RETURN_PERIODS, {"units": "years"}),
+            "lat": ("lat", lat, {"units": "degrees_north"}),
+            "lon": ("lon", lon, {"units": "degrees_east"}),
+        },
+        attrs={
+            "title": "ECMWF ERA5-Drought SPI — Drought Return Period Thresholds",
+            "source": f"s3://{S3_BUCKET}/{PENCIL_S3_PREFIX}",
+            "institution": "European Centre for Medium-Range Weather Forecasts",
+            "history": f"Created {datetime.now().isoformat()}",
+            "distribution": "Normal (standard and fitted) + empirical percentile",
+            "methodology": (
+                "Fitted N(mu,sigma) per pixel + ppf(1/T) + empirical percentile. "
+                "Drought = left tail (negative SPI). Pixels with <30 valid months set to NaN."
+            ),
+            "return_period_labels": str(RP_LABELS),
+            "Conventions": "CF-1.8",
+        },
+    )
+
+    # ── Set up Icechunk store ──
+    # Pan chunk: one SPI-period slab at full spatial extent — (1, n_rp, n_lat, n_lon)
+    pan_chunk = (1, n_rp, n_lat, n_lon)
+    slab_chunk = (1, n_lat, n_lon)   # for 3-D variables (fit_mu, fit_sigma, n_valid)
+
+    store_path = args.store_path
+    if store_path is None:
+        # Write to source.coop S3 using AWS_* env vars
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("SOURCE_COOP_ACCESS_KEY_ID")
+        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("SOURCE_COOP_SECRET_ACCESS_KEY")
+        session_token = os.environ.get("AWS_SESSION_TOKEN") or os.environ.get("SOURCE_COOP_SESSION_TOKEN")
+
+        if not access_key or not secret_key:
+            raise RuntimeError(
+                "Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN) "
+                "in .env or environment for source.coop write access."
+            )
+
+        logger.info(f"  Target: s3://{S3_BUCKET}/{RP_ICECHUNK_S3_PREFIX} (Icechunk)")
+        storage = icechunk.s3_storage(
+            bucket=S3_BUCKET,
+            prefix=RP_ICECHUNK_S3_PREFIX,
+            region=S3_REGION,
+            access_key_id=access_key,
+            secret_access_key=secret_key,
+            session_token=session_token,
+        )
+    else:
+        logger.info(f"  Target: {store_path} (local Icechunk)")
+        storage = icechunk.local_filesystem_storage(path=store_path)
+
+    config = icechunk.RepositoryConfig.default()
+    try:
+        repo = icechunk.Repository.create(storage, config=config)
+        logger.info("  Created new Icechunk repository")
+    except Exception:
+        repo = icechunk.Repository.open(storage, config=config)
+        logger.info("  Opened existing Icechunk repository (overwriting)")
+
+    session = repo.writable_session("main")
+    ds_out.to_zarr(
+        session.store,
+        mode="w",
+        consolidated=False,
+        encoding={
+            "fitted_threshold":    {"chunks": pan_chunk},
+            "empirical_threshold": {"chunks": pan_chunk},
+            "fit_mu":              {"chunks": slab_chunk},
+            "fit_sigma":           {"chunks": slab_chunk},
+            "n_valid_months":      {"chunks": slab_chunk},
+        },
+    )
+    session.commit("ECMWF SPI return period thresholds — all SPI periods")
+
+    elapsed = time.time() - overall_start
+    logger.info("=" * 70)
+    logger.info("COMPUTE-STORE COMPLETE")
+    logger.info(f"  SPI periods: {spi_vars}")
+    logger.info(f"  Return periods: {RETURN_PERIODS}")
+    logger.info(f"  Pan chunk: {pan_chunk}")
+    logger.info(f"  Time: {elapsed / 60:.1f} min")
+    logger.info("=" * 70)
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
@@ -661,6 +1056,52 @@ def main():
     p_map.add_argument("--input", type=str,
                        default="ecmwf_spi_return_periods.nc")
 
+    # ── plot-map-cartopy ──
+    p_cartopy = sub.add_parser(
+        "plot-map-cartopy",
+        help=(
+            "Plot RP threshold maps using cartopy + GeoJSON country overlay. "
+            "Reads RP Icechunk store from source.coop anonymously by default."
+        ),
+    )
+    p_cartopy.add_argument(
+        "--store-path", type=str, default=None,
+        help="Local Icechunk RP store path. Default: reads from source.coop (anonymous).",
+    )
+    p_cartopy.add_argument(
+        "--geojson", type=str, default="ea_ghcf_simple.geojson",
+        help="Path to GeoJSON file with country boundaries.",
+    )
+    p_cartopy.add_argument(
+        "--output-dir", type=str, default="maps",
+        help="Directory for output PNG files (default: maps/).",
+    )
+
+    # ── compute-store ──
+    p_cs = sub.add_parser(
+        "compute-store",
+        help=(
+            "Read pencil zarr from source.coop (or local), compute return period "
+            "thresholds per pixel, write as pan-chunk Icechunk store to source.coop. "
+            "Reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN from .env."
+        ),
+    )
+    p_cs.add_argument(
+        "--source-path", type=str, default=None,
+        help=(
+            "Path to source pencil zarr. "
+            "Default: s3://us-west-2.opendata.source.coop/e4drr-project/observations/era5_ecmwf_pencil"
+        ),
+    )
+    p_cs.add_argument(
+        "--store-path", type=str, default=None,
+        help=(
+            "Local path for output Icechunk store. "
+            "Default: writes directly to source.coop S3 at "
+            "e4drr-project/observations/era5_ecmwf_rp_icechunk"
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.command == "compute":
@@ -671,6 +1112,10 @@ def main():
         run_plot(args)
     elif args.command == "plot-map":
         run_plot_map(args)
+    elif args.command == "plot-map-cartopy":
+        run_plot_map_cartopy(args)
+    elif args.command == "compute-store":
+        compute_from_store(args)
     else:
         parser.print_help()
 
