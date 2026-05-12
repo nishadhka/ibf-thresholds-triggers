@@ -16,6 +16,7 @@ All four datasets share:
 |-------|----------|--------|------------|--------|----------|
 | CHIRPS SPI | spi1, spi3, spi6, spi9, spi12, spi24, spi48 | Copernicus GDO | 0.05 deg, monthly | 1991-2026 | `gs://cpc_awc/chirps_spi_ic_store` |
 | fAPAR Anomaly | fpanv | Copernicus GDO (VIIRS) | 0.083 deg, dekadal | 2012-2026 | `gs://cpc_awc/gdo_fpar_ic_store` |
+| fAPAR Anomaly | fapan | Copernicus GDO (MODIS) | 0.083 deg, dekadal | 2001-2022 | `gs://cpc_awc/gdo_fpar_modis_ic_store` |
 | Soil Moisture Anomaly | smang | Copernicus GDO | 0.05 deg, dekadal | 1995-2026 | `gs://cpc_awc/gdo_sma_ic_store` |
 | RFE2 Rainfall | rfe2 | NOAA CPC/FEWS | 0.1 deg, daily | 2001-2026 | `gs://cpc_awc/rfe2_ic_store` |
 
@@ -106,6 +107,37 @@ uv run --python 3.12 gdo_fpar_icechunk.py verify \
   consistent descending order across all files.
 - Some files have an extra `band` dimension — squeezed out with
   `squeeze("band", drop=True)`.
+
+---
+
+## `gdo_fpar_modis_icechunk.py` — fAPAR Anomalies (MODIS)
+
+Same pipeline shape as the VIIRS script, against the older MODIS-based
+GDO fAPAR product (`ver1-3-1`, 2001–2022, var `fapan`). The MODIS series
+ends 2022-11-11; for 2023+ use the VIIRS store.
+
+**Source**: `https://drought.emergency.copernicus.eu/data/Drought_Observatories_datasets/GDO_Fraction_of_Absorbed_Photosynthetically_Active_Radiation_Anomalies_fAPAR_MODIS/ver1-3-1/`
+
+**Variable**: fapan (fAPAR anomaly from MODIS)
+
+**Store stats**:
+- 22 files (2001-2022), last file truncated at 20221111
+- Grid: 480 lat x 414 lon (0.083 deg)
+- GCS prefix: `gdo_fpar_modis_ic_store`
+- source.coop prefix: `e4drr-project/observations/gdo_fpar_modis_icechunk`
+
+```bash
+# Full pipeline (GCS)
+uv run --python 3.12 gdo_fpar_modis_icechunk.py run \
+    --service-account coiled-data-e4drr_202505.json
+
+# Direct ingest to source.coop
+uv run --python 3.12 gdo_fpar_modis_icechunk.py run --source-coop
+```
+
+Inherits the same `--source-coop`, `--local`, and resume-detection
+behaviour as the VIIRS script. The double-lat / inconsistent-lat-ordering
+fixes apply identically.
 
 ---
 
@@ -268,7 +300,8 @@ All four stores are published to [source.coop](https://source.coop) under
 | Store | S3 Prefix |
 |-------|-----------|
 | CHIRPS SPI | `e4drr-project/observations/chirps_spi_icechunk` |
-| fAPAR Anomaly | `e4drr-project/observations/gdo_fpar_icechunk` |
+| fAPAR Anomaly (VIIRS) | `e4drr-project/observations/gdo_fpar_icechunk` |
+| fAPAR Anomaly (MODIS) | `e4drr-project/observations/gdo_fpar_modis_icechunk` |
 | Soil Moisture Anomaly | `e4drr-project/observations/gdo_sma_icechunk` |
 | RFE2 Rainfall | `e4drr-project/observations/rfe2_icechunk` |
 | IMERG HH Precip | `e4drr-project/observations/imerg_hh_icechunk` |
@@ -359,3 +392,92 @@ uv run --python 3.12 rfe2_icechunk.py ingest --source-coop
 
 Requires `SOURCE_COOP_ACCESS_KEY_ID`, `SOURCE_COOP_SECRET_ACCESS_KEY`,
 and optionally `SOURCE_COOP_SESSION_TOKEN` in `.env` or environment.
+
+---
+
+## METAR observations — East Africa
+
+Station-level surface observations to complement the gridded drought stores.
+The same EA bbox (`lat [-14.5, 25.5], lon [19.5, 54.0]`) is used across all
+METAR scripts so station data co-locates cleanly with the gridded products.
+
+| Script | Purpose | Source |
+|--------|---------|--------|
+| `metar_africa_coverage.py` | Station coverage map + histogram for one WB2 partition (defaults to 2020-01) | `gs://weatherbench2/datasets/metar/metar-timeNominal-by-month/` |
+| `metar_ea_backfill_iowa.py` | Per-station historical backfill (2024+) | Iowa Mesonet ASOS (`mesonet.agron.iastate.edu`) |
+| `metar_ea_live_24h.py` | Last-24h (max 72h) live feed | NOAA AWC (`aviationweather.gov/api/data/metar`) |
+| `metar_ea_mam2026_coverage.py` | One-off MAM 2026 coverage analysis from local parquets | Local `data/metar_ea_iowa/` |
+
+The WeatherBench2 mirror covers 2001-07 → 2023-12 (23 years, 270 monthly
+partitions). For 2024-onwards the Iowa Mesonet ASOS API supplies the same
+ICAO stations parsed into a WB2-compatible schema, so
+`pd.concat([wb2_2001_2023, iowa_2024_now])` works directly.
+
+### Backfill schema (`metar_ea_backfill_iowa.py`)
+
+Output partitioned as `data/metar_ea_iowa/year=YYYY/month=MM/YYYY-MM.parquet`,
+matching the WB2 layout. 20 columns, all units normalised to °C / m·s⁻¹ /
+hPa / m:
+
+`stationName, locationName, latitude, longitude, timeObs, timeNominal,
+reportType, temperature, dewpoint, relativeHumidity, windDir, windSpeed,
+windGust, altimeter, seaLevelPressure, visibility, precip1Hour, skyCover1,
+weatherCodes, rawMetar`
+
+The station list is seeded from the WB2 `year=2023/month=12` partition
+(filtered to the EA bbox — 82 stations) so the active set reflects the
+latest available roster, not the 2020 sample.
+
+### MAM 2026 ingest
+
+```bash
+# 82 EA stations × 71 days (2026-03-01 → 2026-05-11) via Iowa Mesonet
+uv run --python 3.12 metar_ea_backfill_iowa.py \
+    --start 2026-03-01 --end 2026-05-12
+
+# Coverage map + histogram for the MAM 2026 window
+uv run --python 3.12 metar_ea_mam2026_coverage.py
+```
+
+**Run stats** (run on 2026-05-12):
+- 82 stations seeded → 72 returned data (10 inactive in this window)
+- 102,808 observations · 1.4 MB Mar + 1.3 MB Apr + 504 KB May parquet
+- ~17 min wall time (paced at 12s between station fetches to stay polite
+  with Iowa Mesonet; occasional 429s retried automatically)
+- Coverage: median 83% of the 1,728 expected hourly slots, ~70 distinct
+  stations reporting per day
+
+Top reporters (≥98% coverage): FMCZ (Mayotte), OTBD (Doha), HKMO (Mombasa),
+HRYR (Kigali), HKEL (Eldoret), and the Saudi cluster (OERK Riyadh, OEJN
+Jeddah, OEAH Al Ahsa, all at 100%). Notably sparse / offline in MAM 2026:
+HDAM Djibouti (7 obs), FZRF Kalemie (35), HUKS Kasese (326).
+
+The `metar_ea_mam2026_coverage.py` script writes
+`metar_ea_mam2026_stations.png` (cartopy station map coloured by
+coverage %) and `metar_ea_mam2026_coverage.png` (histogram + daily
+volume). Both PNGs and the CSV exports of the parquets are intentionally
+kept out of git — regenerate by re-running the script or the small
+parquet-to-csv loop:
+
+```bash
+uv run --python 3.12 --with pandas --with pyarrow - <<'PY'
+import pandas as pd
+from pathlib import Path
+for p in sorted(Path("data/metar_ea_iowa").glob("year=*/month=*/*.parquet")):
+    pd.read_parquet(p).to_csv(p.with_suffix(".csv"), index=False)
+PY
+```
+
+### Live feed
+
+```bash
+# Last 24h, write parquet to data/metar_ea_live/
+uv run --python 3.12 metar_ea_live_24h.py
+
+# Smoke test (6h, print to stdout)
+uv run --python 3.12 metar_ea_live_24h.py --hours 6 --print
+```
+
+Same units/schema as the backfill (with the addition of `elevation` and
+`timeReport` columns from AWC), so live + backfill + WB2 concatenate
+cleanly for any analysis crossing the 2024 boundary.
