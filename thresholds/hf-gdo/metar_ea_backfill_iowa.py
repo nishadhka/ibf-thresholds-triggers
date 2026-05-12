@@ -33,6 +33,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import gcsfs
 import numpy as np
 import pandas as pd
 import requests
@@ -60,7 +61,8 @@ IOWA_COLS = "tmpf,dwpf,relh,drct,sknt,p01i,alti,mslp,vsby,gust,skyc1,wxcodes,met
 def seed_stations():
     """Return DataFrame[stationName, latitude, longitude, locationName] within EA bbox."""
     print(f"Seeding station list from {WB2_SEED_URL}")
-    df = pd.read_parquet(WB2_SEED_URL)
+    fs = gcsfs.GCSFileSystem(token="anon")
+    df = pd.read_parquet(WB2_SEED_URL, filesystem=fs)
     in_box = (
         (df.latitude >= LAT_MIN)
         & (df.latitude <= LAT_MAX)

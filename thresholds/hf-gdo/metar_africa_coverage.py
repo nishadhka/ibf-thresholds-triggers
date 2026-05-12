@@ -25,6 +25,7 @@ Dataset temporal range: 2001-07 to 2023-12 (23 years).
 
 import sys
 
+import gcsfs
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -47,7 +48,10 @@ EXPECTED_SLOTS = 31 * 24
 
 def load_partition(url):
     print(f"Reading {url} ...")
-    df = pd.read_parquet(url)
+    # WB2 bucket is public — use anonymous gcsfs so we don't pick up
+    # whatever default credentials the VM happens to have.
+    fs = gcsfs.GCSFileSystem(token="anon")
+    df = pd.read_parquet(url, filesystem=fs)
     print(f"  total rows: {len(df):,}  unique stations: {df.stationName.nunique():,}")
     return df
 
