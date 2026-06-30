@@ -70,11 +70,17 @@ BASE_URL = "https://ftp.cpc.ncep.noaa.gov/fews/fewsdata/africa/rfe2/geotiff/"
 
 VAR_NAME = "rfe2"
 
-# East Africa bounding box
-EA_LAT_MIN = -14.5
-EA_LAT_MAX = 25.5
-EA_LON_MIN = 19.5
-EA_LON_MAX = 54.0
+# East Africa bounding box — ENLARGED extent so the cGAN truth can be cut as a
+# native-resolution SUBSET (no regridding). Overridable per-run with
+# --lat-min/--lat-max/--lon-min/--lon-max.
+#
+# This extent (lat -16..26, lon 18..56) fully supersets the cGAN (RFE2 variant)
+# target domain (lat -13.65..24.65, lon 19.15..54.25), so a plain spatial crop
+# of this store yields the cGAN truth grid without interpolation.
+EA_LAT_MIN = -16.0
+EA_LAT_MAX = 26.0
+EA_LON_MIN = 18.0
+EA_LON_MAX = 56.0
 
 # GCS Icechunk store
 GCS_BUCKET = "cpc_awc"
@@ -245,6 +251,30 @@ def cmd_ingest(args):
         is_new_store = False
         committed = get_committed_months(repo)
         logger.info(f"  Existing store: {len(committed)} months already ingested")
+
+        # REPLACE guard: appends reuse the existing store's lat/lon coords, so an
+        # extent change would corrupt/fail. If the existing grid does not match
+        # the requested extent, refuse to append and tell the operator to clear
+        # the old store (to genuinely "replace" it) or use a new --gcs-prefix.
+        import xarray as _xr
+        _ds = _xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+        _lat, _lon = _ds["lat"].values, _ds["lon"].values
+        _mismatch = (
+            min(_lat) > EA_LAT_MIN + 0.1 or max(_lat) < EA_LAT_MAX - 0.1 or
+            min(_lon) > EA_LON_MIN + 0.1 or max(_lon) < EA_LON_MAX - 0.1
+        )
+        _ds.close()
+        if _mismatch:
+            raise SystemExit(
+                "\nEXTENT MISMATCH: existing store grid "
+                f"lat[{min(_lat):.2f},{max(_lat):.2f}] lon[{min(_lon):.2f},{max(_lon):.2f}] "
+                f"does not cover the requested extent "
+                f"lat[{EA_LAT_MIN},{EA_LAT_MAX}] lon[{EA_LON_MIN},{EA_LON_MAX}].\n"
+                "To REPLACE the store at the new extent, clear the old one first, e.g.:\n"
+                f"  gsutil -m rm -r gs://{args.gcs_bucket}/{args.gcs_prefix}\n"
+                "then re-run; or write to a new location with --gcs-prefix <name>.")
+    except SystemExit:
+        raise
     except Exception:
         logger.info("  Will create new store with first batch")
 
@@ -451,6 +481,13 @@ def add_storage_args(parser):
                         help="Use local storage instead of GCS")
     parser.add_argument("--source-coop", action="store_true",
                         help="Write to source.coop S3 instead of GCS")
+    # Extent overrides (default to the enlarged module constants). The store is
+    # ingested at NATIVE 0.1deg resolution over this bbox; the cGAN truth is a
+    # plain spatial crop of it (no regrid).
+    parser.add_argument("--lat-min", type=float, default=EA_LAT_MIN)
+    parser.add_argument("--lat-max", type=float, default=EA_LAT_MAX)
+    parser.add_argument("--lon-min", type=float, default=EA_LON_MIN)
+    parser.add_argument("--lon-max", type=float, default=EA_LON_MAX)
 
 
 def main():
@@ -471,6 +508,14 @@ def main():
     add_storage_args(p_vf)
 
     args = parser.parse_args()
+
+    # apply extent overrides to the module-level bbox used by subset_tif_ea()
+    if args.command in ("run", "ingest", "verify"):
+        global EA_LAT_MIN, EA_LAT_MAX, EA_LON_MIN, EA_LON_MAX
+        EA_LAT_MIN, EA_LAT_MAX = args.lat_min, args.lat_max
+        EA_LON_MIN, EA_LON_MAX = args.lon_min, args.lon_max
+        logger.info(f"  Extent: lat [{EA_LAT_MIN}, {EA_LAT_MAX}], "
+                    f"lon [{EA_LON_MIN}, {EA_LON_MAX}]")
 
     if args.command == "run":
         cmd_run(args)
