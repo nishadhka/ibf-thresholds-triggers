@@ -5,7 +5,7 @@
 #   "virtualizarr>=2.7", "obstore", "pandas", "pyarrow", "gcsfs",
 # ]
 # ///
-"""CMORPH Parquet VDS catalog -> Icechunk virtual store (per-DAY builder).
+"""CMORPH Parquet VDS catalog -> Icechunk virtual store (BATCH builder).
 
 The CMORPH counterpart of grib-index-kerchunk/gefs/build_gefs_icechunk.py, and
 the Coiled-free replacement for cmorph_s3_to_gcs_icechunk_parallel.py.
@@ -13,32 +13,34 @@ the Coiled-free replacement for cmorph_s3_to_gcs_icechunk_parallel.py.
 The CMORPH "par" is a single Parquet VDS catalog on GCS
 (gs://cpc_awc/cmorph_catalog/catalog.parquet): one row per 30-min NetCDF file,
 column `kerchunk_refs` (a `{"version":1,"refs":{...}}` JSON string) already holds
-the virtual references. So there is NOTHING to virtualize from S3 and NO Coiled
-cluster is needed -- we read the day's rows, reconstruct virtual datasets from
-the stored refs, and append one day (48 half-hour steps) to the Icechunk store.
+the virtual references -- nothing to virtualize from S3, no Coiled needed.
 
-Reuses the proven #884 OOM fix (cmorph_daily_commit_icechunk.py): one commit per
-day, manifest splitting along `time` (60-day shards) so each append is O(1),
-virtual chunk container over the anonymous NOAA S3 bucket (no data movement).
+This builder appends a *range* of days in ONE commit. Committing per ~60-day
+manifest shard (instead of per day) is what makes the backfill fast: each shard
+is rewritten once, not once per day as it fills. Still a single sequential
+writer -> zero ConflictError/429s. Reconstruction of the batch's files is
+threaded. Reuses the #884 OOM fix: manifest splitting along `time`, virtual
+refs only (no data movement) -> RAM holds one batch of refs (~a few hundred MB).
 
-Usage (single day):
+Usage (one shard):
   export GOOGLE_APPLICATION_CREDENTIALS=coiled-data-e4drr_202505.json
-  uv run build_cmorph_icechunk.py --date 20200101 \
+  uv run build_cmorph_icechunk.py --start 19990919 --end 19991117 \
       --catalog gs://cpc_awc/cmorph_catalog/catalog.parquet \
       --store gs://cpc_awc/icechunk/cmorph-s3-nc
-  # local catalog + local store (smoke test):
-  uv run build_cmorph_icechunk.py --date 20200101 \
-      --catalog /tmp/cmorph_catalog.parquet --store /tmp/cmorph_store
+  # single day: --date 20200101   (alias for --start=--end=date)
 """
 import argparse
 import json
 import os
 import tempfile
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import pandas as pd
 import xarray as xr
 import icechunk
+import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.compute as pc
 
@@ -115,7 +117,7 @@ def open_or_create_repo(storage):
     return repo, True
 
 
-def last_done_date(repo) -> pd.Timestamp | None:
+def last_done_time(repo) -> pd.Timestamp | None:
     try:
         ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
         return pd.Timestamp(ds.time.values[-1]) if ds.sizes.get("time") else None
@@ -123,62 +125,72 @@ def last_done_date(repo) -> pd.Timestamp | None:
         return None
 
 
-def read_day_refs(catalog: str, sa_key: str | None, date: str) -> list[dict]:
-    """Read one day's rows from the Parquet VDS catalog, chronological."""
-    y, m, d = int(date[:4]), int(date[4:6]), int(date[6:])
+def read_range_refs(catalog: str, sa_key: str | None, start: str, end: str,
+                    after: pd.Timestamp | None) -> pd.DataFrame:
+    """All catalog rows in [start,end] (chronological, success only, > after)."""
     fs = None
+    path = catalog
     if catalog.startswith("gs://"):
         import gcsfs
         fs = gcsfs.GCSFileSystem(
             token=sa_key or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
-        catalog = catalog[5:]
-    dset = pads.dataset(catalog, filesystem=fs, format="parquet")
-    flt = (pc.field("year") == y) & (pc.field("month") == m) & (pc.field("day") == d)
-    tbl = dset.to_table(columns=["datetime", "status", "kerchunk_refs"], filter=flt)
-    df = tbl.to_pandas().sort_values("datetime")
-    df = df[df.status == "success"]
-    return [json.loads(s) for s in df.kerchunk_refs]
+        path = catalog[5:]
+    lo = datetime(int(start[:4]), int(start[4:6]), int(start[6:]))
+    hi = datetime(int(end[:4]), int(end[4:6]), int(end[6:])) + timedelta(days=1)
+    if after is not None and after.to_pydatetime() >= lo:
+        lo = after.to_pydatetime() + timedelta(microseconds=1)
+    flt = ((pc.field("datetime") >= pa.scalar(lo, pa.timestamp("us")))
+           & (pc.field("datetime") < pa.scalar(hi, pa.timestamp("us")))
+           & (pc.field("status") == "success"))
+    tbl = pads.dataset(path, filesystem=fs, format="parquet").to_table(
+        columns=["datetime", "kerchunk_refs"], filter=flt)
+    return tbl.to_pandas().sort_values("datetime").reset_index(drop=True)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", required=True, help="YYYYMMDD")
+    ap.add_argument("--start", help="YYYYMMDD (inclusive)")
+    ap.add_argument("--end", help="YYYYMMDD (inclusive)")
+    ap.add_argument("--date", help="single day (alias for --start=--end=date)")
     ap.add_argument("--catalog", default="gs://cpc_awc/cmorph_catalog/catalog.parquet")
     ap.add_argument("--store", required=True)
     ap.add_argument("--sa-key", default=None)
+    ap.add_argument("--threads", type=int, default=12)
     args = ap.parse_args()
+    start = args.start or args.date
+    end = args.end or args.date
+    if not (start and end):
+        ap.error("need --start/--end or --date")
     t0 = _time.time()
 
     storage = resolve_storage(args.store, args.sa_key)
     repo, created = open_or_create_repo(storage)
-    last = last_done_date(repo)
-    day = pd.Timestamp(f"{args.date[:4]}-{args.date[4:6]}-{args.date[6:]}")
-    if last is not None and day.date() <= last.date():
-        raise SystemExit(f"{args.date} already in store (through {last.date()})")
+    last = last_done_time(repo)
 
-    refs_list = read_day_refs(args.catalog, args.sa_key, args.date)
-    if not refs_list:
-        raise SystemExit(f"{args.date}: no rows in catalog")
+    df = read_range_refs(args.catalog, args.sa_key, start, end, last)
+    if df.empty:
+        raise SystemExit(f"{start}..{end}: nothing to do (after {last})")
 
-    vdss, skipped = [], []
-    for refs in refs_list:
-        vds = reconstruct_vds(refs)
-        if tuple(vds["cmorph"].shape[1:]) != STANDARD_GRID:
-            skipped.append(tuple(vds["cmorph"].shape))
-            continue
-        vdss.append(vds)
-    if not vdss:
-        raise SystemExit(f"{args.date}: 0 usable files (skipped {skipped})")
+    refs_list = [json.loads(s) for s in df.kerchunk_refs]
+    with ThreadPoolExecutor(args.threads) as ex:
+        vdss = list(ex.map(reconstruct_vds, refs_list))
+    good, skipped = [], []
+    for v in vdss:
+        (good if tuple(v["cmorph"].shape[1:]) == STANDARD_GRID else skipped).append(v)
+    if not good:
+        raise SystemExit(f"{start}..{end}: 0 usable files")
 
-    day_vds = xr.concat(vdss, dim="time", coords="minimal", compat="override")
+    batch_vds = xr.concat(good, dim="time", coords="minimal", compat="override")
     session = repo.writable_session("main")
-    day_vds.virtualize.to_icechunk(
+    batch_vds.virtualize.to_icechunk(
         session.store, append_dim=None if last is None else "time")
+    d0 = pd.Timestamp(df.datetime.iloc[0]).strftime("%Y%m%d")
+    d1 = pd.Timestamp(df.datetime.iloc[-1]).strftime("%Y%m%d")
     snap = session.commit(
-        f"{args.date}: {len(vdss)} files, {day_vds.sizes['time']} timesteps")
-    print(f"{args.date}: committed {len(vdss)} files / {day_vds.sizes['time']} steps "
+        f"{d0}..{d1}: {len(good)} files, {batch_vds.sizes['time']} timesteps")
+    print(f"{d0}..{d1}: committed {len(good)} files / {batch_vds.sizes['time']} steps "
           f"-> {str(snap)[:12]} ({_time.time()-t0:.1f}s)"
-          + (f" | skipped grids {skipped}" if skipped else ""))
+          + (f" | skipped {len(skipped)} off-grid" if skipped else ""))
 
 
 if __name__ == "__main__":

@@ -101,7 +101,9 @@ def main():
     ap.add_argument("--sa-key", default=None)
     ap.add_argument("--start", default=None, help="YYYYMMDD")
     ap.add_argument("--end", default=None, help="YYYYMMDD")
-    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--limit", type=int, default=None, help="max BATCHES this run")
+    ap.add_argument("--batch-days", type=int, default=60,
+                    help="days appended per commit (~1 manifest shard = 60)")
     ap.add_argument("--work-dir", default="/tmp/cmorph_backfill")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -115,38 +117,42 @@ def main():
 
     done = dates_done(args.store, args.sa_key)
     todo = [d for d in days if d not in done]
+    # group the contiguous todo list into batches of --batch-days (one commit each)
+    batches = [todo[i:i + args.batch_days] for i in range(0, len(todo), args.batch_days)]
     log.info(f"catalog: {len(days)} days in scope | in store: {len(days)-len(todo)} "
-             f"| to build: {len(todo)}" + (f" (limited to {args.limit})" if args.limit else ""))
+             f"| to build: {len(todo)} days in {len(batches)} batch(es) of "
+             f"{args.batch_days}" + (f" (limited to {args.limit})" if args.limit else ""))
     if args.limit:
-        todo = todo[:args.limit]
+        batches = batches[:args.limit]
     if args.dry_run:
-        if todo:
-            log.info(f"first: {todo[0]}  last: {todo[-1]}")
+        if batches:
+            log.info(f"first batch: {batches[0][0]}..{batches[0][-1]}  "
+                     f"last batch: {batches[-1][0]}..{batches[-1][-1]}")
         return
 
     t_start, times, fails = time.time(), [], []
-    for i, date in enumerate(todo, 1):
+    for i, batch in enumerate(batches, 1):
         t0 = time.time()
-        cmd = [sys.executable, str(BUILDER), "--date", date,
+        cmd = [sys.executable, str(BUILDER), "--start", batch[0], "--end", batch[-1],
                "--catalog", local_cat, "--store", args.store]
         if args.sa_key:
             cmd += ["--sa-key", args.sa_key]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
-            fails.append(date)
-            log.error(f"[{i}/{len(todo)}] {date}: FAILED -- "
-                      f"{(r.stdout[-300:] + r.stderr[-300:]).strip()}")
+            fails.append(f"{batch[0]}..{batch[-1]}")
+            log.error(f"[{i}/{len(batches)}] {batch[0]}..{batch[-1]}: FAILED -- "
+                      f"{(r.stdout[-400:] + r.stderr[-400:]).strip()}")
             continue
         dt = time.time() - t0
         times.append(dt)
-        eta_h = (len(todo) - i) * (sum(times[-50:]) / len(times[-50:])) / 3600
-        log.info(f"[{i}/{len(todo)}] {r.stdout.strip().splitlines()[-1]} "
-                 f"(ETA {eta_h:.1f} h)")
+        eta_h = (len(batches) - i) * (sum(times[-10:]) / len(times[-10:])) / 3600
+        log.info(f"[{i}/{len(batches)}] {r.stdout.strip().splitlines()[-1]} "
+                 f"({dt:.0f}s, ETA {eta_h:.1f} h)")
 
-    log.info(f"done: {len(times)} built, {len(fails)} failed in "
+    log.info(f"done: {len(times)} batches built, {len(fails)} failed in "
              f"{(time.time()-t_start)/3600:.2f} h")
     if fails:
-        log.info(f"failed dates (re-run to retry): {fails}")
+        log.info(f"failed batches (re-run to retry): {fails}")
 
 
 if __name__ == "__main__":
