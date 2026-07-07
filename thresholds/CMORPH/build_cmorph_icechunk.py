@@ -117,9 +117,10 @@ def open_or_create_repo(storage):
     return repo, True
 
 
-def last_done_time(repo) -> pd.Timestamp | None:
+def last_done_time(repo, group: str = "") -> pd.Timestamp | None:
     try:
-        ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+        ds = xr.open_zarr(repo.readonly_session("main").store,
+                          group=group or None, consolidated=False)
         return pd.Timestamp(ds.time.values[-1]) if ds.sizes.get("time") else None
     except Exception:
         return None
@@ -147,11 +148,12 @@ def read_range_refs(catalog: str, sa_key: str | None, start: str, end: str,
     return tbl.to_pandas().sort_values("datetime").reset_index(drop=True)
 
 
-def store_chunk(repo) -> tuple | None:
-    """Chunk shape of the store's existing `cmorph` array, or None if empty."""
+def store_chunk(repo, group: str = "") -> tuple | None:
+    """Chunk shape of the store's existing `cmorph` array (in `group`), or None."""
     import zarr
     try:
-        g = zarr.open_group(repo.readonly_session("main").store, mode="r")
+        g = zarr.open_group(repo.readonly_session("main").store, mode="r",
+                            path=group or "")
         return tuple(g["cmorph"].chunks)
     except Exception:
         return None
@@ -178,6 +180,8 @@ def main():
     ap.add_argument("--date", help="single day (alias for --start=--end=date)")
     ap.add_argument("--catalog", default="gs://cpc_awc/cmorph_catalog/catalog.parquet")
     ap.add_argument("--store", required=True)
+    ap.add_argument("--group", default="",
+                    help="zarr group (e.g. cmorph_832); default root for the 501,1506 era")
     ap.add_argument("--sa-key", default=None)
     ap.add_argument("--threads", type=int, default=12)
     args = ap.parse_args()
@@ -189,7 +193,7 @@ def main():
 
     storage = resolve_storage(args.store, args.sa_key)
     repo, created = open_or_create_repo(storage)
-    last = last_done_time(repo)
+    last = last_done_time(repo, args.group)
 
     df = read_range_refs(args.catalog, args.sa_key, start, end, last)
     if df.empty:
@@ -199,9 +203,9 @@ def main():
     urls = list(df.s3_url)
 
     # 1) chunk-shape filter: a zarr array has ONE chunking, so only files whose
-    # cmorph chunk shape matches the store's array can be virtual-referenced.
-    # Target = the store's existing chunk, or (empty store) the batch's modal chunk.
-    target = store_chunk(repo)
+    # cmorph chunk shape matches the group's array can be virtual-referenced.
+    # Target = the group's existing chunk, or (empty group) the batch's modal chunk.
+    target = store_chunk(repo, args.group)
     if target is None:
         from collections import Counter
         target = Counter(file_chunk(r) for r in refs_list).most_common(1)[0][0]
@@ -236,7 +240,8 @@ def main():
     batch_vds = xr.concat(good, dim="time", coords="minimal", compat="override")
     session = repo.writable_session("main")
     batch_vds.virtualize.to_icechunk(
-        session.store, append_dim=None if last is None else "time")
+        session.store, group=args.group or None,
+        append_dim=None if last is None else "time")
     d0 = pd.Timestamp(df.datetime.iloc[0]).strftime("%Y%m%d")
     d1 = pd.Timestamp(df.datetime.iloc[-1]).strftime("%Y%m%d")
     snap = session.commit(

@@ -71,7 +71,7 @@ def all_days(local_catalog: str) -> list[str]:
     return [d.strftime("%Y%m%d") for d in days]
 
 
-def dates_done(store: str, sa_key: str | None) -> set[str]:
+def dates_done(store: str, sa_key: str | None, group: str = "") -> set[str]:
     import icechunk
     import xarray as xr
     if store.startswith("gs://"):
@@ -87,7 +87,8 @@ def dates_done(store: str, sa_key: str | None) -> set[str]:
         {"s3://noaa-cdr-precip-cmorph-pds/": icechunk.s3_anonymous_credentials()})
     repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
     try:
-        ds = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+        ds = xr.open_zarr(repo.readonly_session("main").store,
+                          group=group or None, consolidated=False)
         return {pd.Timestamp(t).strftime("%Y%m%d")
                 for t in pd.DatetimeIndex(ds.time.values).normalize().unique()}
     except Exception:
@@ -97,6 +98,8 @@ def dates_done(store: str, sa_key: str | None) -> set[str]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", required=True)
+    ap.add_argument("--group", default="",
+                    help="zarr group for a chunk-regime (e.g. cmorph_832); default root")
     ap.add_argument("--catalog", default=CATALOG)
     ap.add_argument("--sa-key", default=None)
     ap.add_argument("--start", default=None, help="YYYYMMDD")
@@ -115,7 +118,7 @@ def main():
     if args.end:
         days = [d for d in days if d <= args.end]
 
-    done = dates_done(args.store, args.sa_key)
+    done = dates_done(args.store, args.sa_key, args.group)
     todo = [d for d in days if d not in done]
     # group the contiguous todo list into batches of --batch-days (one commit each)
     batches = [todo[i:i + args.batch_days] for i in range(0, len(todo), args.batch_days)]
@@ -135,6 +138,8 @@ def main():
         t0 = time.time()
         cmd = [sys.executable, str(BUILDER), "--start", batch[0], "--end", batch[-1],
                "--catalog", local_cat, "--store", args.store]
+        if args.group:
+            cmd += ["--group", args.group]
         if args.sa_key:
             cmd += ["--sa-key", args.sa_key]
         r = subprocess.run(cmd, capture_output=True, text=True)
