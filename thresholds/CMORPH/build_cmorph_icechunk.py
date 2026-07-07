@@ -143,8 +143,32 @@ def read_range_refs(catalog: str, sa_key: str | None, start: str, end: str,
            & (pc.field("datetime") < pa.scalar(hi, pa.timestamp("us")))
            & (pc.field("status") == "success"))
     tbl = pads.dataset(path, filesystem=fs, format="parquet").to_table(
-        columns=["datetime", "kerchunk_refs"], filter=flt)
+        columns=["s3_url", "datetime", "kerchunk_refs"], filter=flt)
     return tbl.to_pandas().sort_values("datetime").reset_index(drop=True)
+
+
+def store_chunk(repo) -> tuple | None:
+    """Chunk shape of the store's existing `cmorph` array, or None if empty."""
+    import zarr
+    try:
+        g = zarr.open_group(repo.readonly_session("main").store, mode="r")
+        return tuple(g["cmorph"].chunks)
+    except Exception:
+        return None
+
+
+def file_chunk(refs: dict) -> tuple:
+    return tuple(json.loads(refs["refs"]["cmorph/.zarray"])["chunks"])
+
+
+def log_skips(store: str, skips: list[dict]):
+    if not skips:
+        return
+    import pathlib
+    tag = store.rstrip("/").split("/")[-1]
+    p = pathlib.Path(__file__).parent / f"cmorph_skipped_{tag}.json"
+    prev = json.loads(p.read_text()) if p.exists() else []
+    p.write_text(json.dumps(prev + skips, indent=2))
 
 
 def main():
@@ -172,13 +196,42 @@ def main():
         raise SystemExit(f"{start}..{end}: nothing to do (after {last})")
 
     refs_list = [json.loads(s) for s in df.kerchunk_refs]
+    urls = list(df.s3_url)
+
+    # 1) chunk-shape filter: a zarr array has ONE chunking, so only files whose
+    # cmorph chunk shape matches the store's array can be virtual-referenced.
+    # Target = the store's existing chunk, or (empty store) the batch's modal chunk.
+    target = store_chunk(repo)
+    if target is None:
+        from collections import Counter
+        target = Counter(file_chunk(r) for r in refs_list).most_common(1)[0][0]
+    keep, skips = [], []
+    for url, refs in zip(urls, refs_list):
+        ch = file_chunk(refs)
+        if ch == target:
+            keep.append((url, refs))
+        else:
+            skips.append({"s3_url": url, "reason": "chunk-mismatch",
+                          "chunks": list(ch), "target": list(target)})
+
+    # 2) reconstruct with per-file try/except -- a single bad file must not
+    # sink the whole batch (the #884 "skip offenders to sidecar" rule).
+    def _recon(item):
+        url, refs = item
+        try:
+            return reconstruct_vds(refs), None
+        except Exception as e:
+            return None, {"s3_url": url, "reason": "reconstruct-error", "error": str(e)[:200]}
+    good = []
     with ThreadPoolExecutor(args.threads) as ex:
-        vdss = list(ex.map(reconstruct_vds, refs_list))
-    good, skipped = [], []
-    for v in vdss:
-        (good if tuple(v["cmorph"].shape[1:]) == STANDARD_GRID else skipped).append(v)
+        for vds, err in ex.map(_recon, keep):
+            (good.append(vds) if err is None else skips.append(err))
+
+    log_skips(args.store, skips)
     if not good:
-        raise SystemExit(f"{start}..{end}: 0 usable files")
+        print(f"{start}..{end}: 0 usable files, skipped {len(skips)} "
+              f"(chunk/recon) -> sidecar ({_time.time()-t0:.1f}s)")
+        return
 
     batch_vds = xr.concat(good, dim="time", coords="minimal", compat="override")
     session = repo.writable_session("main")
@@ -190,7 +243,7 @@ def main():
         f"{d0}..{d1}: {len(good)} files, {batch_vds.sizes['time']} timesteps")
     print(f"{d0}..{d1}: committed {len(good)} files / {batch_vds.sizes['time']} steps "
           f"-> {str(snap)[:12]} ({_time.time()-t0:.1f}s)"
-          + (f" | skipped {len(skipped)} off-grid" if skipped else ""))
+          + (f" | skipped {len(skips)} -> sidecar" if skips else ""))
 
 
 if __name__ == "__main__":
