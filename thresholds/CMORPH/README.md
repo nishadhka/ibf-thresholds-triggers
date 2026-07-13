@@ -3,6 +3,108 @@
 Cloud-native processing of NOAA CDR CMORPH 30-min precipitation data
 (1998-2024) for East Africa.
 
+There are **two** Icechunk stores here; pick by what you need:
+
+| store | what it is | use it when |
+|---|---|---|
+| `gs://cpc_awc/icechunk/cmorph-s3-nc-v2` | **Global, virtual** (refs into NOAA's S3; no data copied). Full native 0.08° grid, 1998-01-01 → 2024-12-31. | You need any region / the whole globe, or the full native record. |
+| `gs://cpc_awc/icechunk/cmorph_ea_*` | **East Africa, materialized + pencil-chunked.** | You need fast repeated point/time-series reads over EA (0.5 s for a 27-yr series). |
+
+The rest of this README covers the EA materialized pipeline. The global virtual
+store is summarised next, and fully documented in
+[`CMORPH_ICECHUNK_S3_NC_UPLOAD.md`](CMORPH_ICECHUNK_S3_NC_UPLOAD.md).
+
+---
+
+## Global virtual store (`cmorph-s3-nc-v2`) — complete
+
+All **236,688** catalog rows converted (100%), 1998-01-01 → 2024-12-31,
+9,862 days / 473,376 half-hour steps. Verified: monotonic, no duplicates,
+virtual S3 reads 99.9–100% finite.
+
+CMORPH re-chunked its NetCDFs twice over the record. A zarr array has exactly
+**one** chunking and a *virtual* ref must land on the array's chunk grid, so each
+chunk-regime lives in its **own group** of the one store:
+
+| group | window(s) | chunk shape |
+|---|---|---|
+| `/` (root) | 1998-01-01 → 2020-06-30 | `(1, 501, 1506)` |
+| `cmorph_832` | 2020-07-01 → 2022-08-31, 2023-06-01 → 2023-07-31 | `(1, 832, 2497)` |
+| `cmorph_825` | 2022-09-01 → 2023-05-31, 2023-08-01 → 2024-12-31 | `(1, 825, 2474)` |
+
+The two post-2020 groups **overlap in wall-clock time** (the regimes interleave)
+but their day sets are **disjoint** — every day is in exactly one group.
+
+### `read_cmorph_v2.py` — all three eras as ONE series, in one command
+
+The group split is a *storage* constraint, not a data one: `lat`/`lon` are
+identical across groups, so on read they concat cleanly along `time` into a
+single continuous series. Verified across both era boundaries, including the
+interleaved 2023 `cmorph_825`→`cmorph_832` switch.
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=coiled-data-e4drr_202505.json
+
+# East Africa, one season, daily totals -> NetCDF   (the intended use)
+uv run read_cmorph_v2.py --bbox -16 26 18 56 \
+    --start 2024-03-01 --end 2024-05-31 --daily --out ea_mam2024.nc
+
+# a point, one month
+uv run read_cmorph_v2.py --point -1.29 36.82 --start 2024-03-01 --end 2024-03-31 --daily
+
+# what would a given request cost? (fetches nothing)
+uv run read_cmorph_v2.py --bbox -16 26 18 56 --estimate
+```
+
+From Python: `from read_cmorph_v2 import open_cmorph; ds = open_cmorph(bbox=(-16,26,18,56), start=..., end=...)`
+
+`cmorph` is a **rate in mm/hr** on 30-min steps; `--daily` converts to mm/day
+totals. Longitudes are stored 0–360 but −180…180 input is accepted.
+
+#### ⚠️ Cost — this store is chunked SPATIALLY, so cost scales with TIME
+
+A chunk spans a large lat/lon tile but only **one** 30-min step (root =
+`(1, 501, 1506)`). So:
+
+    S3 fetches ≈ n_timesteps × n_chunks_intersecting_your_region
+
+A point is **not** cheaper per step than a small box — it just wastes more of
+each chunk. Measured on this VM (96 fetches → 155 s; 384 → 249 s), i.e.
+**~124 s fixed + ~0.33 s per fetch**:
+
+| request | fetches | ETA | |
+|---|---:|---|---|
+| EA box, 8 days | 384 | ~4 min | ok |
+| EA box, one season | 4,416 | ~26 min | ok — the intended use |
+| full record at a point | 473,376 | **~43 h** | ❌ |
+| full record, EA box | 867,792 | **~78 h** (~1.1 TB out) | ❌ |
+
+**Use this store for: any region over a bounded window** (days → a season).
+**For multi-year series at a point/small box, use the materialized,
+pencil-chunked EA store** (`cmorph_east_africa_icechunk.py`, chunked
+`(473376, 5, 5)`) — it does a full 27-year point series in ~0.5 s. That is
+exactly the tradeoff the two stores exist to cover.
+
+`--estimate` costs a request without fetching anything; reads projected over
+30 min are **refused** unless you pass `--force`. Note `--daily` collapses 48
+steps/day, so a season *scans* 10.7 GB but only *writes* 0.2 GB.
+
+A single continuous *stored* array across all regimes would need a
+materialize-rechunk (copies data, no longer virtual) — not done.
+
+### Building / extending it
+
+```bash
+STORE=gs://cpc_awc/icechunk/cmorph-s3-nc-v2
+uv run backfill_cmorph_icechunk.py --store $STORE --end 20200630 --batch-days 60  # root era
+bash run_post2020_groups.sh                                                       # post-2020 groups
+```
+
+Both are **resumable and idempotent** — they read each group's existing `time`
+axis and build only what's missing.
+
+---
+
 ## Current Status
 
 | Phase | Status | Detail |
