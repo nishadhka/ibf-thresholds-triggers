@@ -1,0 +1,2 @@
+# GCP service-account key (secret credential) -- never commit
+coiled-data-*.json

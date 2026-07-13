@@ -44,6 +44,31 @@ import pyarrow as pa
 import pyarrow.dataset as pads
 import pyarrow.compute as pc
 
+def _patch_virtualizarr_group_append():
+    """virtualizarr 2.7.0: appending into a *named* group raises
+    `KeyError: '//<group>/lon'`.
+
+    On append, coords without the append dim (lat/lon) still go down the write
+    path, and their chunks are inlined. `write_manifest_to_icechunk` builds
+    `key_prefix = f"{group.name}/{arr_name}"`, and a named group's `.name`
+    carries a leading "/" -> "/cmorph_832/lon", which icechunk's `store.set`
+    resolves to the malformed "//cmorph_832/lon". The root group is unaffected
+    (`.name == "/"` -> bare "lon"), which is why the 501,1506 era never hit it.
+
+    The virtual-ref path already tolerates the leading slash, so stripping it
+    on the inlined-chunk write is sufficient.
+    """
+    import virtualizarr.writers.icechunk as vzic
+    orig = vzic.write_inlined_chunks_as_native
+
+    async def patched(store, key_prefix, inlined, chunk_index_offsets):
+        return await orig(store, key_prefix.lstrip("/"), inlined, chunk_index_offsets)
+
+    vzic.write_inlined_chunks_as_native = patched
+
+
+_patch_virtualizarr_group_append()
+
 S3_PREFIX = "s3://noaa-cdr-precip-cmorph-pds/"
 S3_REGION = "us-east-1"
 STANDARD_GRID = (1649, 4948)
