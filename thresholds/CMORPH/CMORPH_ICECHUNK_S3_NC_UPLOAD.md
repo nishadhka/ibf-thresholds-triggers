@@ -1,6 +1,11 @@
 # CMORPH → Icechunk: upload record (`cmorph-s3-nc-v2` — COMPLETE)
 
 **Store:** `gs://cpc_awc/icechunk/cmorph-s3-nc-v2` ← **use this one**
+**Published (public, anonymous):**
+https://source.coop/e4drr-project/observations/s3-noaa-cdr-cmorph-icechunk-vd
+(mirror via `mirror_cmorph_to_source_coop.py`; 1,410 objects / 163 MB, since the
+store is virtual. Reading it needs `force_path_style=True` and **no** `AWS_*`
+env vars set — see the README for the two DNS gotchas.)
 **Superseded:** `gs://cpc_awc/icechunk/cmorph-s3-nc` (v1 — has a 2004-2005 gap, no
 post-2020; safe to retire).
 **Source (par):** `gs://cpc_awc/cmorph_catalog/catalog.parquet` (236,688 rows, one

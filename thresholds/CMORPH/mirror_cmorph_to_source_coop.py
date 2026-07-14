@@ -67,6 +67,8 @@ GROUPS = [None, "cmorph_832", "cmorph_825"]
 # (uploaded last). `overwritten` is intentionally excluded (see module docstring).
 DATA_SUBDIRS = ["manifests", "snapshots", "transactions", "chunks"]
 
+RETRIES = 5   # per-object retries for transient 5xx from source.coop
+
 
 def list_source(fs, store, subdirs):
     """(relpath, size) for every file object under the store's data subdirs."""
@@ -88,17 +90,36 @@ def verify_published(bucket: str, dest: str, endpoint: str) -> None:
     that the virtual refs still reach NOAA's public S3 from the new location.
     """
     import icechunk
+
+    region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+    # Isolate the AWS_* env before opening. `source .env` sets AWS_ENDPOINT_URL to
+    # source.coop, and icechunk would apply it to the VIRTUAL-chunk S3 client too,
+    # sending NOAA reads to `noaa-cdr-precip-cmorph-pds.data.source.coop` (DNS
+    # failure). Everything we need is passed explicitly, and both reads are
+    # anonymous, so the credentials/endpoint in the env are not wanted here.
+    saved = {k: os.environ.pop(k) for k in
+             ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+              "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION") if k in os.environ}
+    try:
+        # source.coop needs PATH-style addressing: the default virtual-host style
+        # would resolve `<bucket>.data.source.coop`, which does not exist in DNS.
+        storage = icechunk.s3_storage(
+            bucket=bucket, prefix=dest, endpoint_url=endpoint, region=region,
+            force_path_style=True, anonymous=True)
+        auth = icechunk.containers_credentials(
+            {NOAA_PREFIX: icechunk.s3_anonymous_credentials()})
+        repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+        store = repo.readonly_session("main").store
+        _read_groups(store)
+    finally:
+        os.environ.update(saved)
+
+
+def _read_groups(store) -> None:
     import numpy as np
     import pandas as pd
     import xarray as xr
-
-    storage = icechunk.s3_storage(
-        bucket=bucket, prefix=dest, endpoint_url=endpoint,
-        region="us-west-2", anonymous=True)
-    auth = icechunk.containers_credentials(
-        {NOAA_PREFIX: icechunk.s3_anonymous_credentials()})
-    repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
-    store = repo.readonly_session("main").store
 
     for group in GROUPS:
         ds = xr.open_zarr(store, group=group, consolidated=False)
@@ -184,8 +205,22 @@ def main():
     else:
         def put(rel):
             data = fs.cat_file(f"{store}/{rel}")   # single GET; single PUT (no multipart)
-            s3.put_object(Bucket=args.bucket, Key=f"{dest}/{rel}", Body=data)
-            return len(data)
+            # source.coop occasionally returns a transient 5xx (e.g. 520) on PutObject.
+            # Retry those with backoff -- one flaky object must not sink the run and
+            # block the repo pointer. Auth failures are NOT retried (see is_expired).
+            for attempt in range(RETRIES):
+                try:
+                    s3.put_object(Bucket=args.bucket, Key=f"{dest}/{rel}", Body=data)
+                    return len(data)
+                except ClientError as e:
+                    code = str(e.response.get("Error", {}).get("Code", ""))
+                    status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+                    transient = status >= 500 or code in ("RequestTimeout", "SlowDown",
+                                                          "InternalError", "ServiceUnavailable")
+                    if not transient or attempt == RETRIES - 1:
+                        raise
+                    time.sleep(2 ** attempt)       # 1s, 2s, 4s, 8s
+            raise AssertionError("unreachable")
 
         t0 = time.time()
         done = done_bytes = 0

@@ -92,6 +92,50 @@ steps/day, so a season *scans* 10.7 GB but only *writes* 0.2 GB.
 A single continuous *stored* array across all regimes would need a
 materialize-rechunk (copies data, no longer virtual) — not done.
 
+### Published on source.coop (public, anonymous)
+
+Mirrored to
+**https://source.coop/e4drr-project/observations/s3-noaa-cdr-cmorph-icechunk-vd**
+(1,410 objects, 163 MB — it is *virtual*, so the ~1.1 TB of actual data stays in
+NOAA's public bucket). Verified: opens anonymously and the virtual refs resolve.
+
+```bash
+source .env    # source.coop STS creds (1-hour tokens)
+uv run mirror_cmorph_to_source_coop.py               # copy + verify (resumable)
+uv run mirror_cmorph_to_source_coop.py --verify-only # just read the published store
+```
+
+Reading it needs **no credentials at all**:
+
+```python
+import icechunk, xarray as xr
+
+storage = icechunk.s3_storage(
+    bucket="e4drr-project",
+    prefix="observations/s3-noaa-cdr-cmorph-icechunk-vd",
+    endpoint_url="https://data.source.coop",
+    region="us-east-1",
+    force_path_style=True,     # source.coop is NOT virtual-host addressed
+    anonymous=True)
+auth = icechunk.containers_credentials(
+    {"s3://noaa-cdr-precip-cmorph-pds/": icechunk.s3_anonymous_credentials()})
+repo = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+store = repo.readonly_session("main").store
+
+ds = xr.open_zarr(store, consolidated=False)                     # root era
+ds_832 = xr.open_zarr(store, group="cmorph_832", consolidated=False)
+```
+
+> ⚠️ **Two gotchas, both of which will bite you with a DNS error:**
+> 1. `force_path_style=True` is required — the default virtual-host style
+>    resolves `e4drr-project.data.source.coop`, which does not exist.
+> 2. **Do not have `AWS_ENDPOINT_URL` set in your environment when reading.**
+>    If `.env` is sourced, icechunk applies that endpoint to the *virtual-chunk*
+>    S3 client too and sends NOAA reads to
+>    `noaa-cdr-precip-cmorph-pds.data.source.coop`. Unset the `AWS_*` vars (both
+>    reads are anonymous, so you need none of them). `mirror_cmorph_to_source_coop.py`
+>    does this isolation internally.
+
 ### Building / extending it
 
 ```bash
