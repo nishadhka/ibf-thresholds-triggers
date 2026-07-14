@@ -1,2 +1,5 @@
 # GCP service-account key (secret credential) -- never commit
 coiled-data-*.json
+
+# source.coop STS credentials (1-hour tokens) -- never commit
+.env
