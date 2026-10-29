@@ -44,6 +44,9 @@ Usage:
     # Parallel with local threads (no cluster, ~1.5h from non-AWS host)
     uv run --python 3.12 chirps_daily_icechunk.py ingest --source-coop --threads 16
 
+    # Resume with credentials from the source-coop CLI (after `source-coop login`)
+    uv run --python 3.12 chirps_daily_icechunk.py ingest --source-coop-cli --threads 16
+
     # Verify store contents
     uv run --python 3.12 chirps_daily_icechunk.py verify --source-coop
 
@@ -91,8 +94,41 @@ GCS_PREFIX = "chirps_daily_ic_store"
 SOURCE_COOP_BUCKET = "us-west-2.opendata.source.coop"
 SOURCE_COOP_PREFIX = "e4drr-project/observations/chirps_daily_icechunk"
 
+# Same store through the source.coop data proxy, which accepts the STS
+# credentials minted by the `source-coop` CLI (the raw bucket does not).
+SOURCE_COOP_PROXY = "https://data.source.coop"
+SOURCE_COOP_PROXY_BUCKET = "e4drr-project"
+SOURCE_COOP_PROXY_PREFIX = "observations/chirps_daily_icechunk"
+
 # Chunking: ~1 month of daily data per time chunk
 ZARR_CHUNK_TIME = 31
+
+
+def source_coop_cli_credentials():
+    """Credentials from `source-coop creds`, which refreshes them from the cached login.
+
+    Run `source-coop login --duration 12h` once first. Icechunk calls this
+    again whenever the credentials expire.
+    """
+    import json
+    import subprocess
+    from datetime import datetime
+
+    import icechunk
+
+    cli = os.getenv("SOURCE_COOP_CLI", os.path.expanduser("~/.local/bin/source-coop"))
+    out = subprocess.run([cli, "creds", "--format", "credential-process"],
+                         capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        raise SystemExit(f"no source.coop login: {out.stderr.strip()}\n"
+                         "run: source-coop login --duration 12h")
+    c = json.loads(out.stdout)
+    return icechunk.S3StaticCredentials(
+        access_key_id=c["AccessKeyId"],
+        secret_access_key=c["SecretAccessKey"],
+        session_token=c["SessionToken"],
+        expires_after=datetime.fromisoformat(c["Expiration"].replace("Z", "+00:00")),
+    )
 
 
 def get_storage(args):
@@ -102,6 +138,17 @@ def get_storage(args):
     if args.local:
         logger.info(f"  Storage: local ({args.local})")
         return icechunk.local_filesystem_storage(path=args.local)
+
+    if args.source_coop_cli:
+        logger.info(f"  Storage: {SOURCE_COOP_PROXY}/{SOURCE_COOP_PROXY_BUCKET}/{SOURCE_COOP_PROXY_PREFIX} (source-coop CLI creds)")
+        return icechunk.s3_storage(
+            bucket=SOURCE_COOP_PROXY_BUCKET,
+            prefix=SOURCE_COOP_PROXY_PREFIX,
+            region="us-west-2",
+            endpoint_url=SOURCE_COOP_PROXY,
+            force_path_style=True,
+            get_credentials=source_coop_cli_credentials,
+        )
 
     if args.source_coop:
         logger.info(f"  Storage: s3://{SOURCE_COOP_BUCKET}/{SOURCE_COOP_PREFIX}")
@@ -236,6 +283,42 @@ def results_to_arrays(results):
     return arrays
 
 
+COMMIT_RETRIES = 5
+
+
+def append_month(repo, combined, month_key):
+    """Append one month and commit, retrying transient storage errors with a fresh session.
+
+    The source.coop proxy occasionally returns an empty error body. If a commit's
+    response is lost but the commit landed, the tip already carries the message,
+    so the month is not appended twice.
+    """
+    import xarray as xr
+
+    message = f"ingest {month_key}"
+    for attempt in range(1, COMMIT_RETRIES + 1):
+        if next(iter(repo.ancestry(branch="main"))).message == message:
+            return
+        try:
+            session = repo.writable_session("main")
+            ds_existing = xr.open_zarr(session.store, consolidated=False)
+            ds_append = xr.Dataset({
+                VAR_NAME: (("time", "lat", "lon"), combined.values),
+            }, coords={
+                "time": combined.time.values,
+                "lat": ds_existing.lat.values,
+                "lon": ds_existing.lon.values,
+            })
+            ds_append.to_zarr(session.store, append_dim="time", consolidated=False)
+            session.commit(message)
+            return
+        except Exception as e:
+            if attempt == COMMIT_RETRIES:
+                raise
+            logger.warning(f"    {month_key} attempt {attempt} failed ({e}); retrying")
+            time.sleep(10 * attempt)
+
+
 def get_committed_months(repo):
     """Return set of month keys already committed to icechunk store."""
     committed = set()
@@ -359,12 +442,12 @@ def cmd_ingest(args):
         except Exception as e:
             logger.error(f"    Batch fetch failed for {month_key}: {e}")
             total_failed += 1
-            continue
+            break  # a skipped month would leave a gap; re-run to resume here
 
         if not arrays:
-            logger.error(f"    No data for {month_key}, skipping commit")
+            logger.error(f"    No data for {month_key}, stopping")
             total_failed += 1
-            continue
+            break
 
         # Concatenate month
         combined = xr.concat(arrays, dim="time", join="override").sortby("time")
@@ -421,23 +504,7 @@ def cmd_ingest(args):
                 logger.info(f"    Store created, {len(arrays)} days committed ({elapsed_batch:.0f}s)")
 
             else:
-                session = repo.writable_session("main")
-                ds_existing = xr.open_zarr(session.store, consolidated=False)
-
-                ds_append = xr.Dataset({
-                    VAR_NAME: (("time", "lat", "lon"), combined.values),
-                }, coords={
-                    "time": combined.time.values,
-                    "lat": ds_existing.lat.values,
-                    "lon": ds_existing.lon.values,
-                })
-
-                ds_append.to_zarr(
-                    session.store,
-                    append_dim="time",
-                    consolidated=False,
-                )
-                session.commit(f"ingest {month_key}")
+                append_month(repo, combined, month_key)
                 elapsed_batch = time.time() - batch_start
                 logger.info(f"    Appended {len(arrays)} days ({elapsed_batch:.0f}s)")
 
@@ -450,6 +517,8 @@ def cmd_ingest(args):
             import traceback
             logger.error(traceback.format_exc())
             total_failed += 1
+            # Stop: appending later months would leave a gap in the time axis
+            break
 
     elapsed = time.time() - overall_start
     logger.info("\n" + "=" * 60)
@@ -545,6 +614,8 @@ def add_storage_args(parser):
                         help="Use local storage instead of GCS")
     parser.add_argument("--source-coop", action="store_true",
                         help="Write to source.coop S3 instead of GCS")
+    parser.add_argument("--source-coop-cli", action="store_true",
+                        help="Write to source.coop through data.source.coop with `source-coop creds` credentials")
     parser.add_argument("--dry-run", action="store_true",
                         help="List available months without ingesting")
     parser.add_argument("--coiled", action="store_true",

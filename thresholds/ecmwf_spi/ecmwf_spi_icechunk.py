@@ -12,6 +12,8 @@
 #     "coiled",
 #     "distributed",
 #     "gcsfs",
+#     "cdsapi",
+#     "six>=1.16",
 # ]
 # ///
 """
@@ -34,6 +36,12 @@ Subcommands:
   fill     — Read local NetCDF files and write into the Icechunk store
   rechunk  — Rechunk to pencil chunks → new Zarr store
   verify   — Inspect store contents
+  download — Fetch new months from the CDS (needs ~/.cdsapirc)
+  append   — Add months after the store's last month from local NetCDF files
+
+Updating the source.coop store (after `source-coop login --duration 12h`):
+    uv run ecmwf_spi_icechunk.py download --start 2026-02 --end 2026-09 --data-dir data_new/
+    uv run ecmwf_spi_icechunk.py append --data-dir data_new/ --source-coop-cli
 
 Usage:
     # Step 1: Create empty template
@@ -89,6 +97,16 @@ PENCIL_CHUNK_SIZE = (-1, 5, 5)  # full time × 5 lat × 5 lon
 
 # Fill value for missing data (SPI uses NaN for ocean/missing)
 FILL_VALUE = np.nan
+
+# source.coop store, reached through the data proxy, which accepts the STS
+# credentials minted by the `source-coop` CLI
+SOURCE_COOP_PROXY = "https://data.source.coop"
+SOURCE_COOP_BUCKET = "e4drr-project"
+SOURCE_COOP_PREFIX = "observations/era5_ecmwf_icechunk"
+
+# CDS request: area matches the store grid (N, W, S, E)
+CDS_DATASET = "derived-drought-historical-monthly"
+CDS_AREA = [25, 20, -15, 53]
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -585,6 +603,159 @@ def verify_store(args):
     logger.info("\nVerification complete.")
 
 
+# ─── Update: download + append ─────────────────────────────────────────────
+
+
+def source_coop_cli_credentials():
+    """Credentials from `source-coop creds`, refreshed from the cached login."""
+    import json
+    import os
+    import subprocess
+
+    import icechunk
+
+    cli = os.getenv("SOURCE_COOP_CLI", os.path.expanduser("~/.local/bin/source-coop"))
+    out = subprocess.run([cli, "creds", "--format", "credential-process"],
+                         capture_output=True, text=True, timeout=120)
+    if out.returncode != 0:
+        raise SystemExit(f"no source.coop login: {out.stderr.strip()}\n"
+                         "run: source-coop login --duration 12h")
+    c = json.loads(out.stdout)
+    return icechunk.S3StaticCredentials(
+        access_key_id=c["AccessKeyId"],
+        secret_access_key=c["SecretAccessKey"],
+        session_token=c["SessionToken"],
+        expires_after=datetime.fromisoformat(c["Expiration"].replace("Z", "+00:00")),
+    )
+
+
+def open_storage(args):
+    """source.coop (CLI creds), GCS, or local Icechunk storage."""
+    import icechunk
+
+    if getattr(args, "source_coop_cli", False):
+        logger.info(f"  Storage: {SOURCE_COOP_PROXY}/{SOURCE_COOP_BUCKET}/{SOURCE_COOP_PREFIX}")
+        return icechunk.s3_storage(
+            bucket=SOURCE_COOP_BUCKET,
+            prefix=SOURCE_COOP_PREFIX,
+            region="us-west-2",
+            endpoint_url=SOURCE_COOP_PROXY,
+            force_path_style=True,
+            get_credentials=source_coop_cli_credentials,
+        )
+    if args.gcs_bucket:
+        return icechunk.gcs_storage(
+            bucket=args.gcs_bucket,
+            prefix=args.gcs_prefix,
+            service_account_file=args.service_account,
+        )
+    return icechunk.local_filesystem_storage(path=args.local or args.store_path)
+
+
+def download_months(args):
+    """Download monthly SPI files from the CDS for every SPI period, unzipped into data_dir."""
+    import zipfile
+
+    import cdsapi
+
+    months = pd.date_range(args.start, args.end, freq="MS")
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    client = cdsapi.Client()
+
+    for spi in [s.strip() for s in args.spi_periods.split(",")]:
+        for year, ym in months.groupby(months.year).items():
+            target = data_dir / f"{spi}_{year}_{ym[0].month:02d}-{ym[-1].month:02d}.zip"
+            if not target.exists():
+                request = {
+                    "variable": ["standardised_precipitation_index"],
+                    "accumulation_period": [spi.removeprefix("SPI")],
+                    "version": "1_0",
+                    "product_type": ["reanalysis"],
+                    "dataset_type": args.dataset_type,
+                    "year": [str(year)],
+                    "month": [f"{t.month:02d}" for t in ym],
+                    "area": CDS_AREA,
+                }
+                logger.info(f"  CDS {spi} {year} months {request['month']}")
+                client.retrieve(CDS_DATASET, request, str(target))
+            if zipfile.is_zipfile(target):
+                with zipfile.ZipFile(target) as z:
+                    z.extractall(data_dir)
+
+    logger.info(f"Downloaded to {data_dir}")
+
+
+def catalog_new_files(data_dir: str):
+    """{spi: {Timestamp: path}} for any SPI NetCDF named *SPI<n>_..._<YYYYMM>*.nc."""
+    import re
+
+    pattern = re.compile(r"^(SPI\d+)_.*?_(\d{4})(\d{2})(?:\D.*)?\.nc$")
+    catalog = {}
+    for f in sorted(Path(data_dir).glob("SPI*.nc")):
+        m = pattern.match(f.name)
+        if m and m.group(1) in SPI_PERIODS:
+            t = pd.Timestamp(year=int(m.group(2)), month=int(m.group(3)), day=1)
+            catalog.setdefault(m.group(1), {})[t] = str(f)
+    return catalog
+
+
+def append_store(args):
+    """Append months after the store's last month, all SPI periods in one commit."""
+    import icechunk
+    import xarray as xr
+
+    logger.info("=" * 60)
+    logger.info("APPEND: new months -> SPI store")
+    logger.info("=" * 60)
+
+    repo = icechunk.Repository.open(open_storage(args), config=icechunk.RepositoryConfig.default())
+    ds_store = xr.open_zarr(repo.readonly_session("main").store, consolidated=False)
+    last = pd.Timestamp(ds_store.time.values[-1])
+    logger.info(f"  Store ends {last:%Y-%m}")
+
+    catalog = catalog_new_files(args.data_dir)
+    new_times = sorted({t for files in catalog.values() for t in files if t > last})
+    if not new_times:
+        logger.info("  Nothing newer than the store in data_dir")
+        return
+    expected = pd.date_range(last + pd.offsets.MonthBegin(1), new_times[-1], freq="MS")
+    if list(expected) != new_times:
+        raise SystemExit(f"new months are not contiguous after {last:%Y-%m}: "
+                         f"{[f'{t:%Y-%m}' for t in new_times]}")
+
+    data_vars = {}
+    for spi in ds_store.data_vars:
+        files = catalog.get(spi, {})
+        missing = [f"{t:%Y-%m}" for t in new_times if t not in files]
+        if missing and not args.allow_missing:
+            raise SystemExit(f"{spi} has no file for {missing} (use --allow-missing to write NaN)")
+        layers = []
+        for t in new_times:
+            if t not in files:
+                layers.append(np.full((ds_store.sizes["lat"], ds_store.sizes["lon"]), np.nan, np.float32))
+                continue
+            with xr.open_dataset(files[t]) as ds:
+                da = ds[[v for v in ds.data_vars if v.startswith("SPI")][0]].squeeze(drop=True)
+                # Same grid as the store, or stop
+                da = da.reindex(lat=ds_store.lat.values, lon=ds_store.lon.values,
+                                method="nearest", tolerance=1e-3)
+                layers.append(da.values.astype(np.float32))
+        data_vars[spi] = (("time", "lat", "lon"), np.stack(layers))
+        logger.info(f"  {spi}: {len(new_times) - len(missing)} months"
+                    + (f", NaN for {missing}" if missing else ""))
+
+    ds_new = xr.Dataset(data_vars, coords={"time": np.array(new_times, dtype="datetime64[ns]")})
+    if args.dry_run:
+        logger.info(f"  DRY RUN: would append {new_times[0]:%Y-%m} .. {new_times[-1]:%Y-%m}")
+        return
+
+    session = repo.writable_session("main")
+    ds_new.to_zarr(session.store, append_dim="time", consolidated=False)
+    snap = session.commit(f"append {new_times[0]:%Y-%m}..{new_times[-1]:%Y-%m}")
+    logger.info(f"  Appended {len(new_times)} months, snapshot {snap}")
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
@@ -650,9 +821,37 @@ def main():
     p_verify.add_argument("--spot-check", action="store_true", default=True)
     p_verify.add_argument("--no-spot-check", action="store_false", dest="spot_check")
 
+    # ── download ──
+    p_dl = sub.add_parser("download", help="Download new months from the CDS")
+    p_dl.add_argument("--start", type=str, required=True, help="First month, YYYY-MM")
+    p_dl.add_argument("--end", type=str, required=True, help="Last month, YYYY-MM")
+    p_dl.add_argument("--data-dir", type=str, default="data_new/")
+    p_dl.add_argument("--spi-periods", type=str, default=",".join(SPI_PERIODS))
+    p_dl.add_argument("--dataset-type", type=str, default="intermediate_dataset",
+                      choices=["intermediate_dataset", "consolidated_dataset"],
+                      help="Recent months are only in the intermediate dataset")
+
+    # ── append ──
+    p_app = sub.add_parser("append", help="Append months after the store's last month")
+    p_app.add_argument("--data-dir", type=str, default="data_new/")
+    p_app.add_argument("--store-path", type=str, default="ecmwf_spi_ea_store")
+    p_app.add_argument("--local", type=str, default=None)
+    p_app.add_argument("--gcs-bucket", type=str, default=None)
+    p_app.add_argument("--gcs-prefix", type=str, default="ecmwf_spi_ea")
+    p_app.add_argument("--service-account", type=str, default=SERVICE_ACCOUNT_FILE)
+    p_app.add_argument("--source-coop-cli", action="store_true",
+                       help="Write to source.coop with `source-coop creds` credentials")
+    p_app.add_argument("--allow-missing", action="store_true",
+                       help="Write NaN for an SPI period that has no file for a month")
+    p_app.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
 
-    if args.command == "init":
+    if args.command == "download":
+        download_months(args)
+    elif args.command == "append":
+        append_store(args)
+    elif args.command == "init":
         init_store(args)
     elif args.command == "fill":
         fill_store(args)
